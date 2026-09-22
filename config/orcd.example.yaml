@@ -1,0 +1,40 @@
+# Copy to config/orcd.yaml and fill values marked REQUIRED.
+# H200 allocation (exact ORCD request):
+#   salloc -N 1 -n 32 --cpus-per-task=1 --mem=128GB --time=06:00:00 -G h200:1
+partition: mit_normal_gpu
+gpu_request: h200:1
+nodes: 1
+ntasks: 32
+cpus_per_task: 1
+memory: 128GB
+wall_time: "06:00:00"
+
+# Optional Slurm account/QoS. Leave empty if your default account can take H200s.
+account: ""
+qos: ""
+reservation: ""
+email: ""
+scratch_root: "REQUIRED"
+
+# Keyed SSH. With auto_evaluate: true the graph rsyncs, salloc/srun, and
+# downloads results without a manual pause.
+# remote_project must be the absolute KernelAgentBench directory. Rsync only
+# writes candidates/<id>/ and reads results/<id>.json. It does not --delete
+# or sync the rest of the clone.
+ssh_host: "orcd-login.mit.edu"
+ssh_user: "REQUIRED"
+ssh_port: 22
+identity_file: ""
+remote_project: "REQUIRED"
+auto_evaluate: true
+# If you already hold an salloc, set the job id and each eval uses srun only.
+salloc_job_id: ""
+
+setup_commands:
+  - module purge
+  - module load julia
+  - module load cuda
+  # - module load python
+  # - source /path/to/UROPJulia/KernelAgentBench/.venv/bin/activate
+
+container_image: ""

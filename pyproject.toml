@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kernel-agent-bench"
+version = "0.1.0"
+description = "Reproducible coding-agent evaluation for Julia GPU kernels"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cursor-sdk>=0.3.0",
+  "langchain-core>=0.3.70",
+  "langgraph>=0.6.0",
+  "langgraph-checkpoint-sqlite>=2.0",
+  "langsmith>=0.4.0",
+  "numpy>=2.0",
+  "pydantic>=2.10",
+  "PyYAML>=6.0.2",
+  "typer>=0.16",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "numba-cuda[cu12]>=0.19",
+]
+dev = [
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+  "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+kernel-agent-bench = "kernel_agent_bench.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kernel_agent_bench"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["kernel_agent_bench"]

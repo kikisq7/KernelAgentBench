@@ -1,0 +1,63 @@
+study_id: gray-scott-cuda-h200-v1
+task_version: gray-scott-2d-five-point-v1
+seed: 20260918
+replicates: 3
+trace_content: true
+
+models:
+  - alias: composer
+    match: "^composer-[0-9]"
+    newest: true
+  - alias: gpt-5.6
+    match: "^gpt-5\\.6$"
+    newest: true
+  - alias: anthropic
+    match: "^claude-opus"
+    newest: true
+
+languages:
+  - id: julia
+    editable_paths:
+      - kernels/gray_scott/candidate.jl
+    public_test_command: >-
+      julia --project=julia julia/test/runtests.jl
+    prompt_path: prompts/optimize_gray_scott_julia.md
+  - id: python
+    editable_paths:
+      - python/gray_scott/candidate.py
+    public_test_command: >-
+      python3 -m pytest python/tests
+    prompt_path: prompts/optimize_gray_scott_python.md
+  - id: cpp
+    editable_paths:
+      - cpp/gray_scott/candidate.cuh
+    public_test_command: >-
+      bash cpp/test/run_cpu_tests.sh
+    prompt_path: prompts/optimize_gray_scott_cpp.md
+
+budgets:
+  # Hard cap: at most five agent turns and five H200 evaluations per trial.
+  max_agent_iterations: 5
+  max_h200_evaluations: 5
+  max_total_tokens: 200000
+  max_wall_seconds: 21600
+
+evaluation:
+  dtype: Float32
+  correctness_shapes:
+    - [31, 29]
+    - [64, 64]
+    - [127, 65]
+  performance_shapes:
+    - [1024, 1024]
+    - [2048, 2048]
+    - [4096, 4096]
+  steps: 1000
+  warmups: 3
+  repetitions: 10
+  atol: 0.00002
+  rtol: 0.0002
+  max_regression_fraction: 0.03
+  # Stop before the cap when speedup does not beat the incumbent (or 1.0x) by 5%.
+  min_relative_improvement: 0.05
+

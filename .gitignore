@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+*.pyc
+.build/
+
+.kernel-agent-bench/
+candidates/
+results/*
+!results/.gitkeep
+
+julia/LocalPreferences.toml
+julia/test/results/
