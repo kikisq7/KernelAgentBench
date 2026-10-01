@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
+
+JULIA_BACKENDS = {
+    "julia": "cuda",
+    "julia-cpu": "cpu",
+    "julia-cuda": "cuda",
+    "julia-ka": "ka",
+}
 
 
 class StrictModel(BaseModel):
@@ -39,11 +46,44 @@ class EvaluationConfig(StrictModel):
     min_relative_improvement: float = Field(ge=0, lt=1)
 
 
+def _path_covered(needed: str, allowed: str) -> bool:
+    needed_n = needed.strip("/")
+    allowed_n = allowed.strip("/")
+    return needed_n == allowed_n or needed_n.startswith(allowed_n + "/")
+
+
 class LanguageTarget(StrictModel):
     id: str
     editable_paths: list[str]
     public_test_command: str
     prompt_path: str
+    backend: Literal["cpu", "cuda", "ka"] = "ka"
+    requires_gpu: bool = True
+    evaluate_locally: bool = False
+    workspace_paths: list[str] = Field(default_factory=list)
+    evaluation: EvaluationConfig | None = None
+
+    @model_validator(mode="after")
+    def workspace_covers_editable_and_prompt(self) -> LanguageTarget:
+        if self.evaluate_locally and self.requires_gpu:
+            raise ValueError(f"{self.id} cannot evaluate locally while requiring a GPU")
+        if not self.workspace_paths:
+            return self
+        required = [*self.editable_paths, self.prompt_path]
+        for needed in required:
+            if not any(_path_covered(needed, allowed) for allowed in self.workspace_paths):
+                raise ValueError(
+                    f"{self.id} workspace_paths must include {needed}"
+                )
+        return self
+
+
+def julia_backend_for_language(language: str) -> str | None:
+    return JULIA_BACKENDS.get(language)
+
+
+def is_julia_language(language: str) -> bool:
+    return language in JULIA_BACKENDS
 
 
 class StudyConfig(StrictModel):
@@ -72,10 +112,10 @@ class OrcdConfig(StrictModel):
     partition: str = "mit_normal_gpu"
     gpu_request: str = "h200:1"
     nodes: int = Field(default=1, ge=1)
-    ntasks: int = Field(default=32, ge=1)
+    ntasks: int = Field(default=1, ge=1)
     cpus_per_task: int = Field(default=1, ge=1)
-    memory: str = "128GB"
-    wall_time: str = "06:00:00"
+    memory: str = "8GB"
+    wall_time: str = "00:20:00"
     account: str = ""
     qos: str = ""
     reservation: str = ""
@@ -156,6 +196,7 @@ class WorkloadResult(StrictModel):
     correct: bool
     max_abs_error: float
     relative_l2_error: float
+    timer: str | None = None
 
 
 class EvaluationResult(StrictModel):
@@ -165,6 +206,7 @@ class EvaluationResult(StrictModel):
     evaluator_version: str
     status: str
     correct: bool
+    backend: str | None = None
     correctness_cases: list[dict[str, Any]] = Field(default_factory=list)
     workloads: list[WorkloadResult] = Field(default_factory=list)
     geometric_mean_speedup: float | None = None

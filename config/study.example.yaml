@@ -1,4 +1,4 @@
-study_id: gray-scott-cuda-h200-v1
+study_id: gray-scott-julia-backends-v1
 task_version: gray-scott-2d-five-point-v1
 seed: 20260918
 replicates: 3
@@ -9,34 +9,76 @@ models:
     match: "^composer-[0-9]"
     newest: true
   - alias: gpt-5.6
-    match: "^gpt-5\\.6$"
+    match: "^gpt-5\\.6-sol$"
     newest: true
   - alias: anthropic
     match: "^claude-opus"
     newest: true
 
+# Julia-only study. Agents still run the existing optimize → test → eval loop.
+# KernelAbstractions is the focus track (CPU + NVIDIA now; AMD/ROCm later).
 languages:
-  - id: julia
+  - id: julia-ka
+    backend: ka
+    requires_gpu: true
+    evaluate_locally: false
     editable_paths:
-      - kernels/gray_scott/candidate.jl
+      - kernels/gray_scott/ka/candidate.jl
+    workspace_paths:
+      - kernels/gray_scott/reference.jl
+      - kernels/gray_scott/ka
+      - julia
+      - prompts/optimize_gray_scott_ka.md
     public_test_command: >-
-      julia --project=julia julia/test/runtests.jl
-    prompt_path: prompts/optimize_gray_scott_julia.md
-  - id: python
+      julia --project=julia julia/test/runtests.jl ka
+    prompt_path: prompts/optimize_gray_scott_ka.md
+  - id: julia-cuda
+    backend: cuda
+    requires_gpu: true
+    evaluate_locally: false
     editable_paths:
-      - python/gray_scott/candidate.py
+      - kernels/gray_scott/cuda/candidate.jl
+    workspace_paths:
+      - kernels/gray_scott/reference.jl
+      - kernels/gray_scott/cuda
+      - julia
+      - prompts/optimize_gray_scott_cuda.md
     public_test_command: >-
-      python3 -m pytest python/tests
-    prompt_path: prompts/optimize_gray_scott_python.md
-  - id: cpp
+      julia --project=julia julia/test/runtests.jl cuda
+    prompt_path: prompts/optimize_gray_scott_cuda.md
+  - id: julia-cpu
+    backend: cpu
+    requires_gpu: false
+    evaluate_locally: true
     editable_paths:
-      - cpp/gray_scott/candidate.cuh
+      - kernels/gray_scott/cpu/candidate.jl
+    workspace_paths:
+      - kernels/gray_scott/reference.jl
+      - kernels/gray_scott/cpu
+      - julia
+      - prompts/optimize_gray_scott_cpu.md
     public_test_command: >-
-      bash cpp/test/run_cpu_tests.sh
-    prompt_path: prompts/optimize_gray_scott_cpp.md
+      julia --project=julia julia/test/runtests.jl cpu
+    prompt_path: prompts/optimize_gray_scott_cpu.md
+    evaluation:
+      dtype: Float32
+      correctness_shapes:
+        - [31, 29]
+        - [64, 64]
+        - [127, 65]
+      performance_shapes:
+        - [256, 256]
+        - [512, 512]
+        - [1024, 1024]
+      steps: 200
+      warmups: 1
+      repetitions: 5
+      atol: 0.00002
+      rtol: 0.0002
+      max_regression_fraction: 0.03
+      min_relative_improvement: 0.05
 
 budgets:
-  # Hard cap: at most five agent turns and five H200 evaluations per trial.
   max_agent_iterations: 5
   max_h200_evaluations: 5
   max_total_tokens: 200000
@@ -58,6 +100,4 @@ evaluation:
   atol: 0.00002
   rtol: 0.0002
   max_regression_fraction: 0.03
-  # Stop before the cap when speedup does not beat the incumbent (or 1.0x) by 5%.
   min_relative_improvement: 0.05
-

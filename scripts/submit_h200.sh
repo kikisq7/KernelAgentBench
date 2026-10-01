@@ -20,10 +20,9 @@ python3 -m kernel_agent_bench.cli render-slurm \
   --bundle "$BUNDLE" \
   --output "$SCRIPT"
 
-# Canonical ORCD H200 request. Override with SALLOC_JOB_ID to reuse an open allocation.
+# Submit and return. Override with SALLOC_JOB_ID to reuse an open allocation.
 if [[ -n "${SALLOC_JOB_ID:-}" ]]; then
   srun --jobid="$SALLOC_JOB_ID" --ntasks=1 --gres=gpu:h200:1 bash "$SCRIPT"
 else
-  salloc -N 1 -n 32 --cpus-per-task=1 --mem=128GB --time=06:00:00 -G h200:1 \
-    -- srun --ntasks=1 --gres=gpu:h200:1 bash "$SCRIPT"
+  sbatch --parsable "$SCRIPT"
 fi

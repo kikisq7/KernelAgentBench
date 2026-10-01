@@ -4,10 +4,12 @@ import json
 import re
 import shlex
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .schemas import CandidateManifest, OrcdConfig
+from .schemas import CandidateManifest, OrcdConfig, is_julia_language, julia_backend_for_language
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
@@ -18,13 +20,34 @@ def _require_safe_name(value: str, *, label: str) -> str:
     return value
 
 
+def _normalize_abs(path: Path) -> Path:
+    """Collapse . and .. without following local symlinks.
+
+    Remote ORCD paths must not be Path.resolve()'d on macOS: /home becomes
+    /System/Volumes/Data/home and the compute node then mkdir's /System.
+    """
+    if not path.is_absolute():
+        raise ValueError(f"expected an absolute path: {path}")
+    parts: list[str] = []
+    for part in path.parts[1:]:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ValueError(f"path escapes the filesystem root: {path}")
+            parts.pop()
+            continue
+        parts.append(part)
+    return Path("/") / Path(*parts) if parts else Path("/")
+
+
 def _require_contained(root: Path, child: Path, *, label: str) -> Path:
-    resolved_root = root.resolve()
-    resolved_child = child if child.is_absolute() else resolved_root / child
-    escaped = ".." in Path(child).parts
-    if escaped or not resolved_child.resolve().is_relative_to(resolved_root):
-        raise ValueError(f"{label} escapes {resolved_root}: {child}")
-    return resolved_child
+    root_n = _normalize_abs(root if root.is_absolute() else root.resolve())
+    child_path = child if child.is_absolute() else root_n / child
+    child_n = _normalize_abs(child_path)
+    if not child_n.is_relative_to(root_n):
+        raise ValueError(f"{label} escapes {root_n}: {child}")
+    return child_n
 
 
 @dataclass(frozen=True)
@@ -134,27 +157,222 @@ def srun_command(config: OrcdConfig, script: str) -> list[str]:
     return command
 
 
-def ssh_base(config: OrcdConfig) -> list[str]:
+def sbatch_command(config: OrcdConfig, script: str) -> list[str]:
+    del config
+    return ["sbatch", "--parsable", script]
+
+
+_TERMINAL_SLURM = {
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "PREEMPTED",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "SPECIAL_EXIT",
+}
+
+
+def ssh_control_path(config: OrcdConfig) -> str:
+    # A fixed path (user@host:port). Do not use %C: ssh -O check without -p
+    # hashes a different socket than ssh -p 22, so the mux looks dead.
+    token = f"{config.ssh_user}@{config.ssh_host}:{config.ssh_port}"
+    safe = re.sub(r"[^A-Za-z0-9._@:-]", "_", token)
+    return str(Path.home() / ".ssh" / f"kab-{safe}")
+
+
+def resolve_identity(config: OrcdConfig) -> str:
+    if config.identity_file:
+        return config.identity_file
+    for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+        path = Path.home() / ".ssh" / name
+        if path.is_file():
+            return str(path)
+    return ""
+
+
+def ssh_target(config: OrcdConfig) -> str:
+    return f"{config.ssh_user}@{config.ssh_host}"
+
+
+def ssh_master_running(config: OrcdConfig) -> bool:
+    completed = subprocess.run(
+        [
+            "ssh",
+            "-p",
+            str(config.ssh_port),
+            "-O",
+            "check",
+            "-o",
+            f"ControlPath={ssh_control_path(config)}",
+            ssh_target(config),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def ssh_options(config: OrcdConfig, *, batch: bool | None = None) -> list[str]:
+    if batch is None:
+        batch = ssh_master_running(config) or not sys.stdin.isatty()
+    (Path.home() / ".ssh").mkdir(parents=True, exist_ok=True)
     command = [
         "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
         "-p",
         str(config.ssh_port),
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={ssh_control_path(config)}",
+        "-o",
+        "ControlPersist=8h",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=12",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
     ]
-    if config.identity_file:
-        command.extend(["-i", config.identity_file])
-    command.append(f"{config.ssh_user}@{config.ssh_host}")
+    # After the key is accepted, ORCD still requires Duo keyboard-interactive
+    # unless this process is a ControlMaster slave.
+    if ssh_master_running(config):
+        if batch:
+            command.extend(["-o", "BatchMode=yes"])
+        return command
+    identity = resolve_identity(config)
+    if identity:
+        command.extend(["-i", identity, "-o", "IdentitiesOnly=yes"])
+    command.extend(
+        [
+            "-o",
+            "PreferredAuthentications=publickey,keyboard-interactive",
+            "-o",
+            "GSSAPIAuthentication=yes",
+            "-o",
+            "GSSAPIDelegateCredentials=yes",
+        ]
+    )
+    if batch:
+        command.extend(["-o", "BatchMode=yes"])
     return command
 
 
-def rsync_ssh(config: OrcdConfig) -> str:
-    transport = ["ssh", "-o", "BatchMode=yes", "-p", str(config.ssh_port)]
-    if config.identity_file:
-        transport.extend(["-i", config.identity_file])
-    return " ".join(shlex.quote(value) for value in transport)
+def ssh_base(config: OrcdConfig, *, batch: bool | None = None) -> list[str]:
+    return ssh_options(config, batch=batch) + [ssh_target(config)]
+
+
+def rsync_ssh(config: OrcdConfig, *, batch: bool | None = None) -> str:
+    return " ".join(shlex.quote(value) for value in ssh_options(config, batch=batch))
+
+
+def probe_ssh(config: OrcdConfig) -> None:
+    """Reuse a ControlMaster if one exists; otherwise open one (Duo may prompt)."""
+    if ssh_master_running(config):
+        completed = subprocess.run(ssh_base(config, batch=True) + ["true"], check=False)
+        if completed.returncode == 0:
+            return
+    completed = subprocess.run(ssh_base(config, batch=False) + ["true"], check=False)
+    if completed.returncode == 0:
+        return
+    raise RuntimeError(
+        f"SSH to {ssh_target(config)} needs a ControlMaster because ORCD asks "
+        "for Duo after the public key. In a terminal run:\n"
+        f"  kernel-agent-bench ssh-check --orcd config/orcd.yaml\n"
+        "Approve Duo once; later rsync/sbatch reuse the ControlPersist socket."
+    )
+
+
+def remote_mkdir_command(transfer: RemoteTransfer) -> str:
+    return (
+        "mkdir -p "
+        + shlex.quote(str(transfer.remote_bundle))
+        + " "
+        + shlex.quote(str(transfer.remote_script.parent))
+        + " "
+        + shlex.quote(str(transfer.remote_result.parent))
+    )
+
+
+def _run(command: list[str], *, input_text: str | None = None) -> None:
+    completed = subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        detail = "\n".join(
+            part.strip() for part in (completed.stderr, completed.stdout) if part
+        ).strip()
+        raise RuntimeError(
+            f"command failed ({completed.returncode}): {shlex.join(command)}\n{detail}"
+        )
+
+
+def manifest_evaluator_args(manifest: CandidateManifest, output: Path) -> list[str]:
+    args = [
+        "--candidate-id",
+        manifest.candidate_id,
+        "--output",
+        output.as_posix() if output.is_absolute() else str(output),
+        "--dtype",
+        manifest.evaluation.dtype,
+        "--shapes",
+        ",".join(f"{height}x{width}" for height, width in manifest.evaluation.performance_shapes),
+        "--correctness-shapes",
+        ",".join(f"{height}x{width}" for height, width in manifest.evaluation.correctness_shapes),
+        "--steps",
+        str(manifest.evaluation.steps),
+        "--warmups",
+        str(manifest.evaluation.warmups),
+        "--repetitions",
+        str(manifest.evaluation.repetitions),
+        "--atol",
+        str(manifest.evaluation.atol),
+        "--rtol",
+        str(manifest.evaluation.rtol),
+    ]
+    backend = julia_backend_for_language(manifest.language)
+    if backend is not None:
+        args.extend(["--language", manifest.language, "--backend", backend])
+    return args
+
+
+def evaluate_candidate_local(project: Path, workspace: Path, bundle: Path) -> Path:
+    manifest = CandidateManifest.model_validate_json(
+        (bundle / "manifest.json").read_text(encoding="utf-8")
+    )
+    if not is_julia_language(manifest.language):
+        raise ValueError(f"local evaluation is Julia-only; got {manifest.language}")
+    output = project / "results" / f"{manifest.candidate_id}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "julia",
+        f"--project={workspace / 'julia'}",
+        str(workspace / "julia" / "evaluate_candidate.jl"),
+        *manifest_evaluator_args(manifest, output),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if not output.is_file():
+        detail = "\n".join(
+            part.strip() for part in (completed.stderr, completed.stdout) if part
+        ).strip()
+        raise RuntimeError(
+            f"local evaluator produced no result ({completed.returncode}): "
+            f"{shlex.join(command)}\n{detail}"
+        )
+    return output
 
 
 def render_slurm(
@@ -173,33 +391,20 @@ def render_slurm(
     if not local_patch.is_file():
         raise FileNotFoundError(local_patch)
     patch = patch_path or local_patch
-    repository = (repository or project.parent).resolve()
-    relative_project = project.resolve().relative_to(repository)
+    repository = _normalize_abs((repository or project))
+    relative_project = _normalize_abs(project).relative_to(repository)
     scratch = Path(config.scratch_root) / "kernel-agent-bench"
     setup = "\n".join(config.setup_commands)
-    evaluator_args = [
-        "--candidate-id",
-        manifest.candidate_id,
-        "--output",
-        str(result.resolve()),
-        "--dtype",
-        manifest.evaluation.dtype,
-        "--shapes",
-        ",".join(f"{height}x{width}" for height, width in manifest.evaluation.performance_shapes),
-        "--correctness-shapes",
-        ",".join(f"{height}x{width}" for height, width in manifest.evaluation.correctness_shapes),
-        "--steps",
-        str(manifest.evaluation.steps),
-        "--warmups",
-        str(manifest.evaluation.warmups),
-        "--repetitions",
-        str(manifest.evaluation.repetitions),
-        "--atol",
-        str(manifest.evaluation.atol),
-        "--rtol",
-        str(manifest.evaluation.rtol),
-    ]
-    if manifest.language == "julia":
+    if is_julia_language(manifest.language):
+        julia_project = f"{relative_project}/julia"
+        setup = (
+            setup
+            + ("\n" if setup else "")
+            + f"julia --project={shlex.quote(julia_project)} "
+            + "-e 'using Pkg; Pkg.instantiate()'"
+        )
+    evaluator_args = manifest_evaluator_args(manifest, _normalize_abs(result))
+    if is_julia_language(manifest.language):
         executable = [
             "julia",
             f"--project={relative_project}/julia",
@@ -266,11 +471,11 @@ def render_slurm(
 
 set -euo pipefail
 
-REPOSITORY={shlex.quote(str(repository))}
-PATCH={shlex.quote(str(patch.resolve()))}
-WORKTREE={shlex.quote(str(scratch))}/${{SLURM_JOB_ID}}-{shlex.quote(manifest.candidate_id)}
-RESULT={shlex.quote(str(result.resolve()))}
-METADATA={shlex.quote(str(metadata_path.resolve()))}
+REPOSITORY={shlex.quote(repository.as_posix())}
+PATCH={shlex.quote(_normalize_abs(Path(patch)).as_posix())}
+WORKTREE={shlex.quote(_normalize_abs(scratch).as_posix())}/${{SLURM_JOB_ID}}-{shlex.quote(manifest.candidate_id)}
+RESULT={shlex.quote(_normalize_abs(result).as_posix())}
+METADATA={shlex.quote(_normalize_abs(metadata_path).as_posix())}
 
 mkdir -p "$(dirname "$RESULT")" "$(dirname "$WORKTREE")"
 cleanup() {{
@@ -321,11 +526,52 @@ def candidate_id(bundle: Path) -> str:
 
 
 def remote_eval_command(config: OrcdConfig, script: str) -> str:
-    srun = " ".join(shlex.quote(value) for value in srun_command(config, script))
     if config.salloc_job_id:
-        return srun
-    salloc = " ".join(shlex.quote(value) for value in salloc_command(config))
-    return f"{salloc} -- {srun}"
+        return " ".join(shlex.quote(value) for value in srun_command(config, script))
+    return " ".join(shlex.quote(value) for value in sbatch_command(config, script))
+
+
+def _ssh_stdout(config: OrcdConfig, remote: str) -> str:
+    completed = subprocess.run(
+        ssh_base(config, batch=True) + [remote],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        detail = "\n".join(
+            part.strip() for part in (completed.stderr, completed.stdout) if part
+        ).strip()
+        raise RuntimeError(
+            f"command failed ({completed.returncode}): "
+            f"{shlex.join(ssh_base(config, batch=True) + [remote])}\n{detail}"
+        )
+    return completed.stdout.strip()
+
+
+def _parse_sbatch_job_id(output: str) -> str:
+    token = output.splitlines()[-1].strip() if output.strip() else ""
+    job_id = token.split(";", 1)[0].strip()
+    if not job_id.isdigit():
+        raise RuntimeError(f"sbatch did not return a job id: {output!r}")
+    return job_id
+
+
+def wait_for_slurm_job(config: OrcdConfig, job_id: str, *, poll_seconds: int = 30) -> str:
+    """Poll with short SSH commands so the mux is not held open like salloc."""
+    last_state = ""
+    while True:
+        try:
+            last_state = _ssh_stdout(config, f"squeue -j {shlex.quote(job_id)} -h -o %T")
+        except RuntimeError as exc:
+            if "Invalid job id" in str(exc) or "slurm_load_jobs error" in str(exc):
+                return "COMPLETED"
+            probe_ssh(config)
+            last_state = _ssh_stdout(config, f"squeue -j {shlex.quote(job_id)} -h -o %T")
+        state = last_state.split()[0] if last_state else "COMPLETED"
+        if state in _TERMINAL_SLURM or not last_state:
+            return state
+        time.sleep(poll_seconds)
 
 
 def ssh_handoff_commands(
@@ -341,7 +587,7 @@ def ssh_handoff_commands(
     return [
         "# Upload only this candidate bundle; the ORCD clone is not synced:",
         " ".join(shlex.quote(value) for value in rsync_upload_command(config, bundle, transfer)),
-        "# Allocate the H200 and evaluate (or srun if salloc_job_id is set):",
+        "# Submit the H200 eval (sbatch, or srun if salloc_job_id is set):",
         " ".join(shlex.quote(value) for value in ssh_base(config))
         + " "
         + shlex.quote(
@@ -367,41 +613,54 @@ def evaluate_candidate_remote(
     )
     transfer = remote_transfer(config, bundle, local_project)
     transfer.local_result.parent.mkdir(parents=True, exist_ok=True)
+    probe_ssh(config)
+    _run(ssh_base(config, batch=True) + [remote_mkdir_command(transfer)])
 
     script = render_slurm(
         config,
         project=transfer.remote_project,
         bundle=bundle,
         result=transfer.remote_result,
-        repository=transfer.remote_project.parent,
+        repository=transfer.remote_project,
         patch_path=transfer.remote_bundle / manifest.patch_file,
     )
-    subprocess.run(rsync_upload_command(config, bundle, transfer), check=True)
-    mkdir = (
-        "mkdir -p "
-        + shlex.quote(str(transfer.remote_script.parent))
-        + " "
-        + shlex.quote(str(transfer.remote_result.parent))
-    )
-    subprocess.run(ssh_base(config) + [mkdir], check=True)
-    subprocess.run(
-        ssh_base(config)
+    _run(rsync_upload_command(config, bundle, transfer))
+    _run(
+        ssh_base(config, batch=True)
         + [
             "cat > "
             + shlex.quote(str(transfer.remote_script))
             + " && chmod 750 "
             + shlex.quote(str(transfer.remote_script))
         ],
-        input=script,
-        text=True,
-        check=True,
+        input_text=script,
     )
     evaluate = (
         f"cd {shlex.quote(str(transfer.remote_project))} && "
         f"{remote_eval_command(config, str(transfer.remote_script))}"
     )
-    subprocess.run(ssh_base(config) + [evaluate], check=True)
-    subprocess.run(rsync_download_command(config, transfer), check=True)
-    if not transfer.local_result.is_file():
-        raise FileNotFoundError(f"H200 result was not downloaded: {transfer.local_result}")
-    return transfer.local_result
+    eval_error: Exception | None = None
+    try:
+        if config.salloc_job_id:
+            _run(ssh_base(config, batch=True) + [evaluate])
+        else:
+            submitted = _ssh_stdout(config, evaluate)
+            job_id = _parse_sbatch_job_id(submitted)
+            state = wait_for_slurm_job(config, job_id)
+            if state not in {"COMPLETED", "FAILED"}:
+                eval_error = RuntimeError(f"Slurm job {job_id} ended in {state}")
+    except RuntimeError as exc:
+        # Evaluators exit 2 when the candidate is incorrect but still write JSON.
+        # sbatch FAILED is the same case; still try to download the result.
+        eval_error = exc
+    try:
+        _run(rsync_download_command(config, transfer))
+    except RuntimeError:
+        if eval_error is not None:
+            raise eval_error
+        raise
+    if transfer.local_result.is_file():
+        return transfer.local_result
+    if eval_error is not None:
+        raise eval_error
+    raise FileNotFoundError(f"H200 result was not downloaded: {transfer.local_result}")

@@ -4,10 +4,11 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .schemas import CandidateManifest, EvaluationConfig
+from .schemas import CandidateManifest, EvaluationConfig, ensure_relative_paths
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -46,7 +47,7 @@ class CandidateManager:
         resolved_commit = _git(self.repository, "rev-parse", baseline_commit).stdout.strip()
         destination = self.worktrees / trial_id
         if destination.exists():
-            raise FileExistsError(f"trial worktree already exists: {destination}")
+            self.cleanup_worktree(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         _git(
             self.repository,
@@ -72,6 +73,57 @@ class CandidateManager:
         _git(self.repository, "worktree", "remove", "--force", str(resolved), check=False)
         if resolved.exists():
             shutil.rmtree(resolved)
+
+    def materialize_agent_workspace(
+        self,
+        worktree: Worktree,
+        workspace_paths: list[str],
+        trial_id: str,
+    ) -> Path:
+        if not workspace_paths:
+            return worktree.project
+        ensure_relative_paths(workspace_paths, worktree.project)
+        dest = Path(tempfile.mkdtemp(prefix=f"kab-{trial_id}-"))
+        try:
+            for relative in workspace_paths:
+                src = worktree.project / relative
+                if not src.exists():
+                    raise FileNotFoundError(f"workspace path missing from baseline: {relative}")
+                target = dest / relative
+                if src.is_dir():
+                    shutil.copytree(src, target, symlinks=False)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, target)
+        except Exception:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise
+        return dest
+
+    def sync_editable_from_agent(
+        self,
+        worktree: Worktree,
+        agent_workspace: Path,
+        editable_paths: list[str],
+    ) -> None:
+        if agent_workspace.resolve() == worktree.project.resolve():
+            return
+        for relative in editable_paths:
+            src = agent_workspace / relative
+            dest = worktree.project / relative
+            if not src.is_file():
+                raise ValueError(f"agent did not produce {relative}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+
+    def cleanup_agent_workspace(self, agent_workspace: Path, project: Path) -> None:
+        resolved = agent_workspace.resolve()
+        if resolved == project.resolve() or not resolved.exists():
+            return
+        tmp = Path(tempfile.gettempdir()).resolve()
+        if not resolved.is_relative_to(tmp) or not resolved.name.startswith("kab-"):
+            raise ValueError(f"refusing to remove unmanaged agent workspace: {resolved}")
+        shutil.rmtree(resolved)
 
     def changed_paths(self, worktree: Worktree) -> list[str]:
         output = _git(worktree.root, "status", "--porcelain", "--untracked-files=all").stdout

@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from kernel_agent_bench.candidates import CandidateManager
 from kernel_agent_bench.config import canonical_hash
 from kernel_agent_bench.graph import TrialGraph, geometric_mean
 from kernel_agent_bench.models import AgentRun, resolve_model_ids
 from kernel_agent_bench.orcd import (
+    _parse_sbatch_job_id,
+    remote_eval_command,
+    remote_mkdir_command,
     remote_transfer,
     render_slurm,
     rsync_download_command,
+    rsync_ssh,
     rsync_upload_command,
     salloc_command,
+    ssh_control_path,
     ssh_handoff_commands,
 )
 from kernel_agent_bench.schemas import (
@@ -28,7 +35,7 @@ from kernel_agent_bench.schemas import (
     TokenRecord,
     WorkloadResult,
 )
-from kernel_agent_bench.tracing import trace_payload
+from kernel_agent_bench.tracing import configure_tracing, trace_payload
 
 
 def test_model_resolution_uses_newest_natural_version() -> None:
@@ -77,13 +84,13 @@ def test_orcd_required_fields_and_salloc_flags() -> None:
         "-N",
         "1",
         "-n",
-        "32",
+        "1",
         "--cpus-per-task",
         "1",
         "--mem",
-        "128GB",
+        "8GB",
         "--time",
-        "06:00:00",
+        "00:20:00",
         "-G",
         "h200:1",
         "-p",
@@ -93,7 +100,9 @@ def test_orcd_required_fields_and_salloc_flags() -> None:
 @pytest.mark.parametrize(
     ("language", "expected_command"),
     [
-        ("julia", "julia/evaluate_candidate.jl"),
+        ("julia-ka", "--backend ka"),
+        ("julia-cpu", "--backend cpu"),
+        ("julia-cuda", "--backend cuda"),
         ("python", "python/evaluate_candidate.py"),
         ("cpp", "nvcc -O3"),
     ],
@@ -127,10 +136,10 @@ def test_slurm_renderer_freezes_candidate_evaluation(
         partition="mit_normal_gpu",
         gpu_request="h200:1",
         nodes=1,
-        ntasks=32,
+        ntasks=1,
         cpus_per_task=1,
-        memory="128GB",
-        wall_time="06:00:00",
+        memory="8GB",
+        wall_time="00:20:00",
         account="",
         scratch_root="/scratch/user",
         ssh_host="orcd-login.mit.edu",
@@ -144,15 +153,26 @@ def test_slurm_renderer_freezes_candidate_evaluation(
         bundle=bundle,
         result=project / "results" / "candidate-1.json",
     )
+    assert "/System/" not in script
     assert "#SBATCH -G h200:1" in script
     assert "--correctness-shapes 5x5" in script
     assert "--steps 1" in script
     assert expected_command in script
-    commands = ssh_handoff_commands(config, bundle=bundle, local_project=project)
-    assert any(
-        "salloc -N 1 -n 32 --cpus-per-task 1 --mem 128GB --time 06:00:00 -G h200:1" in command
-        for command in commands
+    remote_script = render_slurm(
+        config,
+        project=Path("/home/user/UROPJulia/KernelAgentBench"),
+        bundle=bundle,
+        result=Path("/home/user/UROPJulia/KernelAgentBench/results/candidate-1.json"),
+        repository=Path("/home/user/UROPJulia/KernelAgentBench"),
+        patch_path=Path(
+            "/home/user/UROPJulia/KernelAgentBench/candidates/candidate-1/candidate.patch"
+        ),
     )
+    assert "/System/" not in remote_script
+    assert "REPOSITORY=/home/user/UROPJulia/KernelAgentBench" in remote_script
+    commands = ssh_handoff_commands(config, bundle=bundle, local_project=project)
+    assert any("sbatch --parsable" in command for command in commands)
+    assert all("salloc " not in command for command in commands)
     assert any("kernel-agent-bench resume --trial trial-1" in command for command in commands)
     rsync_lines = [command for command in commands if command.startswith("rsync ")]
     assert rsync_lines
@@ -171,7 +191,7 @@ def test_rsync_stays_inside_one_candidate_directory(tmp_path: Path) -> None:
         patch_sha256="0" * 64,
         patch_file="candidate.patch",
         iteration=1,
-        language="julia",
+        language="julia-ka",
         task_version="test",
         study_hash="1" * 64,
         prompt_sha256="2" * 64,
@@ -188,6 +208,18 @@ def test_rsync_stays_inside_one_candidate_directory(tmp_path: Path) -> None:
     upload = rsync_upload_command(config, bundle, transfer)
     download = rsync_download_command(config, transfer)
     assert "--delete" not in upload
+    assert "ControlMaster=auto" in rsync_ssh(config)
+    assert ssh_control_path(config) in rsync_ssh(config)
+    assert "%C" not in rsync_ssh(config)
+    assert ssh_control_path(config).endswith("kab-user@orcd-login.mit.edu:22")
+    assert _parse_sbatch_job_id("23595210\n") == "23595210"
+    assert _parse_sbatch_job_id("23595210;mit_normal_gpu") == "23595210"
+    assert remote_eval_command(config, "/tmp/job.sbatch") == "sbatch --parsable /tmp/job.sbatch"
+    held = config.model_copy(update={"salloc_job_id": "23595210"})
+    assert "--jobid=23595210" in remote_eval_command(held, "/tmp/job.sbatch")
+    assert "salloc " not in remote_eval_command(held, "/tmp/job.sbatch")
+    assert "/candidates/" in remote_mkdir_command(transfer)
+    assert remote_mkdir_command(transfer).startswith("mkdir -p ")
     assert upload[-2] == str(bundle.resolve()) + "/"
     assert upload[-1].endswith("/KernelAgentBench/candidates/candidate-1/")
     assert "/KernelAgentBench/candidates/candidate-1/" in upload[-1]
@@ -199,6 +231,16 @@ def test_rsync_stays_inside_one_candidate_directory(tmp_path: Path) -> None:
         CandidateManifest.model_validate(
             {**manifest.model_dump(mode="json"), "candidate_id": "../escape"}
         )
+
+
+def test_empty_langsmith_key_disables_hosted_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+    configure_tracing()
+    assert os.environ["LANGSMITH_TRACING"] == "false"
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "false"
 
 
 def test_content_redaction() -> None:
@@ -215,10 +257,29 @@ def _git(path: Path, *args: str) -> None:
 
 
 def _study(
-    language: str = "julia",
-    editable_path: str = "kernels/gray_scott/candidate.jl",
+    language: str = "julia-ka",
+    editable_path: str | None = None,
     prompt_path: str = "prompts/task.md",
+    *,
+    evaluate_locally: bool | None = None,
 ) -> StudyConfig:
+    backend = {
+        "julia-cpu": "cpu",
+        "julia-cuda": "cuda",
+        "julia-ka": "ka",
+        "julia": "cuda",
+        "python": "cuda",
+        "cpp": "cuda",
+    }.get(language, "ka")
+    default_editable = {
+        "julia-cpu": "kernels/gray_scott/cpu/candidate.jl",
+        "julia-cuda": "kernels/gray_scott/cuda/candidate.jl",
+        "julia-ka": "kernels/gray_scott/ka/candidate.jl",
+        "julia": "kernels/gray_scott/cuda/candidate.jl",
+        "python": "python/gray_scott/candidate.py",
+        "cpp": "cpp/gray_scott/candidate.cuh",
+    }.get(language, "kernels/gray_scott/ka/candidate.jl")
+    local = backend == "cpu" if evaluate_locally is None else evaluate_locally
     return StudyConfig(
         study_id="test-study",
         task_version="test-task-v1",
@@ -246,7 +307,10 @@ def _study(
         languages=[
             LanguageTarget(
                 id=language,
-                editable_paths=[editable_path],
+                backend=backend,  # type: ignore[arg-type]
+                requires_gpu=not local,
+                evaluate_locally=local,
+                editable_paths=[editable_path or default_editable],
                 public_test_command="python3 -c pass",
                 prompt_path=prompt_path,
             )
@@ -257,7 +321,8 @@ def _study(
 @pytest.mark.parametrize(
     ("language", "editable_path"),
     [
-        ("julia", "kernels/gray_scott/candidate.jl"),
+        ("julia-ka", "kernels/gray_scott/ka/candidate.jl"),
+        ("julia-cuda", "kernels/gray_scott/cuda/candidate.jl"),
         ("python", "python/gray_scott/candidate.py"),
         ("cpp", "cpp/gray_scott/candidate.cuh"),
     ],
@@ -347,7 +412,7 @@ def test_mocked_checkpointed_trial(
 def test_auto_salloc_evaluation_closes_the_loop(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     project = repository / "KernelAgentBench"
-    candidate = project / "kernels" / "gray_scott" / "candidate.jl"
+    candidate = project / "kernels" / "gray_scott" / "ka" / "candidate.jl"
     prompt = project / "prompts" / "task.md"
     candidate.parent.mkdir(parents=True)
     prompt.parent.mkdir(parents=True)
@@ -364,7 +429,7 @@ def test_auto_salloc_evaluation_closes_the_loop(tmp_path: Path) -> None:
 
     def fake_runner(model_id: str, workspace: Path, agent_prompt: str) -> AgentRun:
         del model_id, agent_prompt
-        (workspace / "kernels" / "gray_scott" / "candidate.jl").write_text(
+        (workspace / "kernels" / "gray_scott" / "ka" / "candidate.jl").write_text(
             "baseline = false\n", encoding="utf-8"
         )
         return AgentRun(
@@ -378,13 +443,13 @@ def test_auto_salloc_evaluation_closes_the_loop(tmp_path: Path) -> None:
 
     def fake_evaluate(orcd: OrcdConfig, bundle: Path, local_project: Path) -> Path:
         assert orcd.gpu_request == "h200:1"
-        assert orcd.ntasks == 32
+        assert orcd.ntasks == 1
         manifest = CandidateManifest.model_validate_json(
             (bundle / "manifest.json").read_text(encoding="utf-8")
         )
         result = EvaluationResult(
             candidate_id=manifest.candidate_id,
-            language="julia",
+            language="julia-ka",
             evaluator_version="test",
             status="passed",
             correct=True,
@@ -411,7 +476,7 @@ def test_auto_salloc_evaluation_closes_the_loop(tmp_path: Path) -> None:
             trial_id="trial-auto",
             model_alias="mock",
             resolved_model_id="mock-1",
-            language="julia",
+            language="julia-ka",
             replicate=1,
             orcd=orcd,
         )
@@ -425,7 +490,7 @@ def test_auto_salloc_evaluation_closes_the_loop(tmp_path: Path) -> None:
 def test_stops_early_when_speedup_is_not_significant(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     project = repository / "KernelAgentBench"
-    candidate = project / "kernels" / "gray_scott" / "candidate.jl"
+    candidate = project / "kernels" / "gray_scott" / "ka" / "candidate.jl"
     prompt = project / "prompts" / "task.md"
     candidate.parent.mkdir(parents=True)
     prompt.parent.mkdir(parents=True)
@@ -442,7 +507,7 @@ def test_stops_early_when_speedup_is_not_significant(tmp_path: Path) -> None:
 
     def fake_runner(model_id: str, workspace: Path, agent_prompt: str) -> AgentRun:
         del model_id, agent_prompt
-        path = workspace / "kernels" / "gray_scott" / "candidate.jl"
+        path = workspace / "kernels" / "gray_scott" / "ka" / "candidate.jl"
         path.write_text("baseline = false\n", encoding="utf-8")
         return AgentRun(
             status="finished",
@@ -472,12 +537,12 @@ def test_stops_early_when_speedup_is_not_significant(tmp_path: Path) -> None:
             trial_id="trial-early-stop",
             model_alias="mock",
             resolved_model_id="mock-1",
-            language="julia",
+            language="julia-ka",
             replicate=1,
         )
         result = EvaluationResult(
             candidate_id=waiting["candidate_id"],
-            language="julia",
+            language="julia-ka",
             evaluator_version="test",
             status="passed",
             correct=True,
@@ -493,6 +558,196 @@ def test_stops_early_when_speedup_is_not_significant(tmp_path: Path) -> None:
         assert finished["incumbent_speedup"] == 1.02
     finally:
         graph.close()
+
+
+def test_workspace_paths_must_cover_editable_and_prompt() -> None:
+    with pytest.raises(ValueError, match="workspace_paths must include"):
+        LanguageTarget(
+            id="julia-ka",
+            backend="ka",
+            editable_paths=["kernels/gray_scott/ka/candidate.jl"],
+            workspace_paths=["julia"],
+            public_test_command="true",
+            prompt_path="prompts/optimize_gray_scott_ka.md",
+        )
+
+
+def test_agent_workspace_excludes_other_backends(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    project = repository / "KernelAgentBench"
+    candidate = project / "kernels" / "gray_scott" / "ka" / "candidate.jl"
+    prompt = project / "prompts" / "optimize_gray_scott_ka.md"
+    decoy = project / "kernels" / "gray_scott" / "cuda" / "candidate.jl"
+    harness = project / "src" / "kernel_agent_bench" / "graph.py"
+    candidate.parent.mkdir(parents=True)
+    prompt.parent.mkdir(parents=True)
+    decoy.parent.mkdir(parents=True)
+    harness.parent.mkdir(parents=True)
+    candidate.write_text("baseline = true\n", encoding="utf-8")
+    prompt.write_text("optimize", encoding="utf-8")
+    decoy.write_text("do not read me\n", encoding="utf-8")
+    harness.write_text("harness\n", encoding="utf-8")
+    (project / "julia").mkdir()
+    (project / "julia" / "evaluate_candidate.jl").write_text("eval\n", encoding="utf-8")
+    (project / ".gitignore").write_text(
+        ".kernel-agent-bench/\ncandidates/\nresults/\n", encoding="utf-8"
+    )
+    _git(repository, "init")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "baseline")
+
+    seen: list[Path] = []
+
+    def fake_runner(model_id: str, workspace: Path, agent_prompt: str) -> AgentRun:
+        del model_id, agent_prompt
+        seen.append(workspace)
+        assert (workspace / "kernels" / "gray_scott" / "ka" / "candidate.jl").is_file()
+        assert (workspace / "julia" / "evaluate_candidate.jl").is_file()
+        assert not (workspace / "kernels" / "gray_scott" / "cuda").exists()
+        assert not (workspace / "src").exists()
+        (workspace / "kernels" / "gray_scott" / "ka" / "candidate.jl").write_text(
+            "baseline = false\n", encoding="utf-8"
+        )
+        return AgentRun(
+            status="finished",
+            agent_id="agent-test",
+            run_id="run-test",
+            response="changed candidate",
+            usage=TokenRecord(input_tokens=3, output_tokens=2, total_tokens=5),
+            cost=None,
+        )
+
+    study = _study()
+    study = study.model_copy(
+        update={
+            "languages": [
+                LanguageTarget(
+                    id="julia-ka",
+                    backend="ka",
+                    editable_paths=["kernels/gray_scott/ka/candidate.jl"],
+                    workspace_paths=[
+                        "kernels/gray_scott/ka",
+                        "julia",
+                        "prompts/optimize_gray_scott_ka.md",
+                    ],
+                    public_test_command="python3 -c pass",
+                    prompt_path="prompts/optimize_gray_scott_ka.md",
+                )
+            ]
+        }
+    )
+    graph = TrialGraph(project, model_runner=fake_runner)
+    try:
+        waiting = graph.start(
+            study=study,
+            study_hash=canonical_hash(study),
+            trial_id="trial-slim",
+            model_alias="mock",
+            resolved_model_id="mock-1",
+            language="julia-ka",
+            replicate=1,
+        )
+        assert waiting["status"] == "awaiting_h200_result"
+        assert seen
+        assert seen[0] != Path(waiting["workspace"])
+        worktree_candidate = (
+            Path(waiting["workspace"]) / "kernels" / "gray_scott" / "ka" / "candidate.jl"
+        )
+        assert worktree_candidate.read_text(encoding="utf-8") == "baseline = false\n"
+        assert CandidateManager(project).bundles.is_dir()
+    finally:
+        graph.close()
+
+
+def test_cpu_backend_evaluates_locally(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    project = repository / "KernelAgentBench"
+    candidate = project / "kernels" / "gray_scott" / "cpu" / "candidate.jl"
+    prompt = project / "prompts" / "task.md"
+    candidate.parent.mkdir(parents=True)
+    prompt.parent.mkdir(parents=True)
+    candidate.write_text("baseline = true\n", encoding="utf-8")
+    prompt.write_text("optimize", encoding="utf-8")
+    (project / ".gitignore").write_text(
+        ".kernel-agent-bench/\ncandidates/\nresults/\n", encoding="utf-8"
+    )
+    _git(repository, "init")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "baseline")
+
+    def fake_runner(model_id: str, workspace: Path, agent_prompt: str) -> AgentRun:
+        del model_id, agent_prompt
+        (workspace / "kernels" / "gray_scott" / "cpu" / "candidate.jl").write_text(
+            "baseline = false\n", encoding="utf-8"
+        )
+        return AgentRun(
+            status="finished",
+            agent_id="agent-test",
+            run_id="run-test",
+            response="changed candidate",
+            usage=TokenRecord(input_tokens=3, output_tokens=2, total_tokens=5),
+            cost=None,
+        )
+
+    def fake_local(local_project: Path, workspace: Path, bundle: Path) -> Path:
+        del workspace
+        manifest = CandidateManifest.model_validate_json(
+            (bundle / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest.language == "julia-cpu"
+        result = EvaluationResult(
+            candidate_id=manifest.candidate_id,
+            language="julia-cpu",
+            backend="cpu",
+            evaluator_version="test",
+            status="passed",
+            correct=True,
+            workloads=[],
+            geometric_mean_speedup=1.1,
+        )
+        path = local_project / "results" / f"{manifest.candidate_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(result.model_dump_json(), encoding="utf-8")
+        return path
+
+    graph = TrialGraph(
+        project,
+        model_runner=fake_runner,
+        local_evaluate_runner=fake_local,
+    )
+    try:
+        finished = graph.start(
+            study=_study("julia-cpu"),
+            study_hash=canonical_hash(_study("julia-cpu")),
+            trial_id="trial-cpu",
+            model_alias="mock",
+            resolved_model_id="mock-1",
+            language="julia-cpu",
+            replicate=1,
+        )
+        assert finished["status"] == "finished"
+        assert finished["h200_evaluations"] == 1
+        assert finished["incumbent_speedup"] == 1.1
+    finally:
+        graph.close()
+
+
+def test_study_example_is_julia_backends() -> None:
+    from kernel_agent_bench.config import load_study, project_root
+
+    study = load_study(project_root() / "config" / "study.example.yaml")
+    assert [target.id for target in study.languages] == [
+        "julia-ka",
+        "julia-cuda",
+        "julia-cpu",
+    ]
+    assert [target.backend for target in study.languages] == ["ka", "cuda", "cpu"]
+    assert study.languages[0].requires_gpu is True
+    assert study.languages[2].evaluate_locally is True
 
 
 def test_budgets_are_capped_at_five_tries() -> None:

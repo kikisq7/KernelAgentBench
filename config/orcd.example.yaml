@@ -1,13 +1,13 @@
 # Copy to config/orcd.yaml and fill values marked REQUIRED.
-# H200 allocation (exact ORCD request):
-#   salloc -N 1 -n 32 --cpus-per-task=1 --mem=128GB --time=06:00:00 -G h200:1
+# H200 job request (sbatch by default; same flags as a manual salloc):
+#   1 node, 1 CPU, 8GB, 00:20:00, h200:1, mit_normal_gpu
 partition: mit_normal_gpu
 gpu_request: h200:1
 nodes: 1
-ntasks: 32
+ntasks: 1
 cpus_per_task: 1
-memory: 128GB
-wall_time: "06:00:00"
+memory: 8GB
+wall_time: "00:20:00"
 
 # Optional Slurm account/QoS. Leave empty if your default account can take H200s.
 account: ""
@@ -16,8 +16,9 @@ reservation: ""
 email: ""
 scratch_root: "REQUIRED"
 
-# Keyed SSH. With auto_evaluate: true the graph rsyncs, salloc/srun, and
-# downloads results without a manual pause.
+# SSH uses ControlMaster so one Duo/Kerberos login is reused by rsync.
+# From a terminal: kernel-agent-bench ssh-check --orcd config/orcd.yaml
+# Then start. identity_file is only needed if the key is not the default.
 # remote_project must be the absolute KernelAgentBench directory. Rsync only
 # writes candidates/<id>/ and reads results/<id>.json. It does not --delete
 # or sync the rest of the clone.

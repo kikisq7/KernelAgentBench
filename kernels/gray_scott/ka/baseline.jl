@@ -1,26 +1,30 @@
-module GrayScottCandidate
+module GrayScottBaseline
 
-using CUDA
+using KernelAbstractions
+using ..GrayScottKABackend
 
-export candidate_fields, prepare_candidate, run_candidate!
+export baseline_fields, prepare_baseline, run_baseline!
 
-# This file is the only source file coding agents may edit. The initial
-# candidate intentionally matches the trusted corrected baseline.
-mutable struct CandidateState{A}
+mutable struct BaselineState{B,A}
+    backend::B
     u::A
     v::A
     u_next::A
     v_next::A
 end
 
-function prepare_candidate(u::AbstractMatrix{T}, v::AbstractMatrix{T}) where {T<:AbstractFloat}
-    u_gpu, v_gpu = CuArray(u), CuArray(v)
-    return CandidateState(u_gpu, v_gpu, copy(u_gpu), copy(v_gpu))
+function prepare_baseline(
+    u::AbstractMatrix{T},
+    v::AbstractMatrix{T};
+    backend=select_backend(),
+) where {T<:AbstractFloat}
+    u_dev = to_device(backend, u)
+    v_dev = to_device(backend, v)
+    return BaselineState(backend, u_dev, v_dev, copy(u_dev), copy(v_dev))
 end
 
-function candidate_kernel!(u_next, v_next, u, v, diffusion_u, diffusion_v, feed, kill, dt)
-    y = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    x = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+@kernel function baseline_kernel!(u_next, v_next, u, v, diffusion_u, diffusion_v, feed, kill, dt)
+    y, x = @index(Global, NTuple)
     height, width = size(u)
     if 1 < y < height && 1 < x < width
         u_center = u[y, x]
@@ -35,14 +39,13 @@ function candidate_kernel!(u_next, v_next, u, v, diffusion_u, diffusion_v, feed,
         v_next[y, x] = v_center +
                        dt * (diffusion_v * lap_v + reaction - (feed + kill) * v_center)
     end
-    return
 end
 
-function run_candidate!(state::CandidateState, p, steps::Int)
-    threads = (16, 16)
-    blocks = cld.(size(state.u), threads)
+function run_baseline!(state::BaselineState, p, steps::Int)
+    kernel! = baseline_kernel!(state.backend)
+    ndrange = size(state.u)
     for _ in 1:steps
-        @cuda threads=threads blocks=blocks candidate_kernel!(
+        kernel!(
             state.u_next,
             state.v_next,
             state.u,
@@ -51,14 +54,16 @@ function run_candidate!(state::CandidateState, p, steps::Int)
             p.diffusion_v,
             p.feed,
             p.kill,
-            p.dt,
+            p.dt;
+            ndrange,
         )
+        KernelAbstractions.synchronize(state.backend)
         state.u, state.u_next = state.u_next, state.u
         state.v, state.v_next = state.v_next, state.v
     end
     return state
 end
 
-candidate_fields(state::CandidateState) = (state.u, state.v)
+baseline_fields(state::BaselineState) = (state.u, state.v)
 
 end

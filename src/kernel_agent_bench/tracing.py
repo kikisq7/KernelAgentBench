@@ -14,6 +14,22 @@ def tracing_enabled() -> bool:
     )
 
 
+def configure_tracing() -> None:
+    """LangSmith is optional. An empty key must not enable hosted uploads."""
+    key = (
+        os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY") or ""
+    ).strip()
+    if key:
+        return
+    for name in (
+        "LANGSMITH_TRACING",
+        "LANGSMITH_TRACING_V2",
+        "LANGCHAIN_TRACING",
+        "LANGCHAIN_TRACING_V2",
+    ):
+        os.environ[name] = "false"
+
+
 def trace_payload(
     value: dict[str, Any],
     *,

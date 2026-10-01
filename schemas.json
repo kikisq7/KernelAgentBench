@@ -148,7 +148,7 @@
         "type": "string"
       },
       "schema_version": {
-        "default": "2.0",
+        "default": "2.1",
         "title": "Schema Version",
         "type": "string"
       },
@@ -247,6 +247,18 @@
           "speedup": {
             "title": "Speedup",
             "type": "number"
+          },
+          "timer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Timer"
           }
         },
         "required": [
@@ -266,6 +278,18 @@
     },
     "additionalProperties": false,
     "properties": {
+      "backend": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Backend"
+      },
       "candidate_id": {
         "title": "Candidate Id",
         "type": "string"
@@ -361,7 +385,7 @@
         "title": "Result Sha256"
       },
       "schema_version": {
-        "default": "2.0",
+        "default": "2.1",
         "title": "Schema Version",
         "type": "string"
       },
@@ -521,12 +545,38 @@
       "LanguageTarget": {
         "additionalProperties": false,
         "properties": {
+          "backend": {
+            "default": "ka",
+            "enum": [
+              "cpu",
+              "cuda",
+              "ka"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
           "editable_paths": {
             "items": {
               "type": "string"
             },
             "title": "Editable Paths",
             "type": "array"
+          },
+          "evaluate_locally": {
+            "default": false,
+            "title": "Evaluate Locally",
+            "type": "boolean"
+          },
+          "evaluation": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/EvaluationConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "id": {
             "title": "Id",
@@ -539,6 +589,18 @@
           "public_test_command": {
             "title": "Public Test Command",
             "type": "string"
+          },
+          "requires_gpu": {
+            "default": true,
+            "title": "Requires Gpu",
+            "type": "boolean"
+          },
+          "workspace_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Workspace Paths",
+            "type": "array"
           }
         },
         "required": [
@@ -741,7 +803,7 @@
         "type": "string"
       },
       "schema_version": {
-        "default": "2.0",
+        "default": "2.1",
         "title": "Schema Version",
         "type": "string"
       },

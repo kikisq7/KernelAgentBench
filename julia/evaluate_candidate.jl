@@ -1,18 +1,12 @@
 #!/usr/bin/env julia
 
-using CUDA
+using Dates
 using JSON3
-using LinearAlgebra
 using Statistics
 
 const ROOT = normpath(joinpath(@__DIR__, ".."))
 include(joinpath(ROOT, "kernels", "gray_scott", "reference.jl"))
-include(joinpath(ROOT, "kernels", "gray_scott", "baseline.jl"))
-include(joinpath(ROOT, "kernels", "gray_scott", "candidate.jl"))
-
 using .GrayScottReference
-using .GrayScottBaseline
-using .GrayScottCandidate
 
 function parse_args(args)
     parsed = Dict{String,String}()
@@ -30,6 +24,23 @@ parse_shapes(value) = [
     Tuple(parse.(Int, split(shape, 'x'))) for shape in split(value, ',') if !isempty(shape)
 ]
 
+const OPTIONS = parse_args(ARGS)
+const BACKEND = get(OPTIONS, "backend", "ka")
+BACKEND in ("cpu", "cuda", "ka") || error("backend must be cpu, cuda, or ka")
+const KERNEL_DIR = joinpath(ROOT, "kernels", "gray_scott", BACKEND)
+
+if BACKEND != "cpu"
+    using CUDA
+end
+if BACKEND == "ka"
+    include(joinpath(KERNEL_DIR, "backend.jl"))
+    using .GrayScottKABackend
+end
+include(joinpath(KERNEL_DIR, "baseline.jl"))
+include(joinpath(KERNEL_DIR, "candidate.jl"))
+using .GrayScottBaseline
+using .GrayScottCandidate
+
 function errors(actual_u, actual_v, expected_u, expected_v)
     max_abs = max(
         maximum(abs.(actual_u .- expected_u)),
@@ -42,17 +53,46 @@ function errors(actual_u, actual_v, expected_u, expected_v)
     return Float64(max_abs), Float64(relative)
 end
 
-function candidate_correctness(dtype, shapes, p, atol, rtol)
+function host_fields(fields)
+    return Array(fields[1]), Array(fields[2])
+end
+
+function make_states(initial_u, initial_v, backend, ka_device)
+    if backend == "ka"
+        return (
+            prepare_baseline(initial_u, initial_v; backend=ka_device),
+            prepare_candidate(initial_u, initial_v; backend=ka_device),
+        )
+    end
+    return prepare_baseline(initial_u, initial_v), prepare_candidate(initial_u, initial_v)
+end
+
+uses_cuda_events(backend, state) = backend == "cuda" ||
+    (backend == "ka" && nameof(typeof(state.backend)) == :CUDABackend)
+
+timer_name(backend, state) = uses_cuda_events(backend, state) ? "cuda_event" : "cpu_ns"
+
+if BACKEND == "cpu"
+    synchronize_run(backend, state) = nothing
+    function timed_run!(backend, runner, state, p, steps)
+        started = time_ns()
+        runner(state, p, steps)
+        return Float64((time_ns() - started) / 1e6)
+    end
+else
+    include(joinpath(@__DIR__, "timing_gpu.jl"))
+end
+
+function candidate_correctness(backend, ka_device, dtype, shapes, p, atol, rtol)
     cases = []
     for shape in shapes
         initial_u, initial_v = initialize_fields(dtype, shape)
         for steps in (1, 5)
             expected_u, expected_v = cpu_simulate(initial_u, initial_v, p, steps)
-            state = prepare_candidate(initial_u, initial_v)
-            run_candidate!(state, p, steps)
-            CUDA.synchronize()
-            actual_u_gpu, actual_v_gpu = candidate_fields(state)
-            actual_u, actual_v = Array(actual_u_gpu), Array(actual_v_gpu)
+            _, candidate_state = make_states(initial_u, initial_v, backend, ka_device)
+            run_candidate!(candidate_state, p, steps)
+            synchronize_run(backend, candidate_state)
+            actual_u, actual_v = host_fields(candidate_fields(candidate_state))
             max_abs, relative = errors(actual_u, actual_v, expected_u, expected_v)
             correct = isapprox(actual_u, expected_u; atol=atol, rtol=rtol) &&
                       isapprox(actual_v, expected_v; atol=atol, rtol=rtol) &&
@@ -71,44 +111,36 @@ function candidate_correctness(dtype, shapes, p, atol, rtol)
     return all(case["correct"] for case in cases), cases
 end
 
-function timed_run!(runner, state, p, steps)
-    seconds = CUDA.@elapsed begin
-        runner(state, p, steps)
-    end
-    return Float64(seconds * 1000)
-end
-
-function benchmark_workload(dtype, shape, p, steps, warmups, repetitions, atol, rtol)
+function benchmark_workload(backend, ka_device, dtype, shape, p, steps, warmups, repetitions, atol, rtol)
     initial_u, initial_v = initialize_fields(dtype, shape)
+    warmup_steps = min(steps, 10)
 
     for _ in 1:warmups
-        timed_run!(run_baseline!, prepare_baseline(initial_u, initial_v), p, min(steps, 10))
-        timed_run!(run_candidate!, prepare_candidate(initial_u, initial_v), p, min(steps, 10))
+        baseline_state, candidate_state = make_states(initial_u, initial_v, backend, ka_device)
+        timed_run!(backend, run_baseline!, baseline_state, p, warmup_steps)
+        timed_run!(backend, run_candidate!, candidate_state, p, warmup_steps)
     end
 
     baseline_samples = Float64[]
     candidate_samples = Float64[]
     last_candidate = nothing
     for repetition in 1:repetitions
-        baseline_state = prepare_baseline(initial_u, initial_v)
-        candidate_state = prepare_candidate(initial_u, initial_v)
+        baseline_state, candidate_state = make_states(initial_u, initial_v, backend, ka_device)
         if isodd(repetition)
-            push!(baseline_samples, timed_run!(run_baseline!, baseline_state, p, steps))
-            push!(candidate_samples, timed_run!(run_candidate!, candidate_state, p, steps))
+            push!(baseline_samples, timed_run!(backend, run_baseline!, baseline_state, p, steps))
+            push!(candidate_samples, timed_run!(backend, run_candidate!, candidate_state, p, steps))
         else
-            push!(candidate_samples, timed_run!(run_candidate!, candidate_state, p, steps))
-            push!(baseline_samples, timed_run!(run_baseline!, baseline_state, p, steps))
+            push!(candidate_samples, timed_run!(backend, run_candidate!, candidate_state, p, steps))
+            push!(baseline_samples, timed_run!(backend, run_baseline!, baseline_state, p, steps))
         end
         last_candidate = candidate_state
     end
 
-    trusted_state = prepare_baseline(initial_u, initial_v)
+    trusted_state, _ = make_states(initial_u, initial_v, backend, ka_device)
     run_baseline!(trusted_state, p, steps)
-    CUDA.synchronize()
-    actual_u_gpu, actual_v_gpu = candidate_fields(last_candidate)
-    expected_u_gpu, expected_v_gpu = baseline_fields(trusted_state)
-    actual_u, actual_v = Array(actual_u_gpu), Array(actual_v_gpu)
-    expected_u, expected_v = Array(expected_u_gpu), Array(expected_v_gpu)
+    synchronize_run(backend, trusted_state)
+    actual_u, actual_v = host_fields(candidate_fields(last_candidate))
+    expected_u, expected_v = host_fields(baseline_fields(trusted_state))
     max_abs, relative = errors(actual_u, actual_v, expected_u, expected_v)
     correct = isapprox(actual_u, expected_u; atol=atol, rtol=rtol) &&
               isapprox(actual_v, expected_v; atol=atol, rtol=rtol)
@@ -127,23 +159,42 @@ function benchmark_workload(dtype, shape, p, steps, warmups, repetitions, atol, 
         "correct" => correct,
         "max_abs_error" => max_abs,
         "relative_l2_error" => relative,
+        "timer" => timer_name(backend, last_candidate),
     )
 end
 
-function environment_metadata()
-    return Dict(
+function environment_metadata(backend, ka_device)
+    meta = Dict{String,Any}(
         "hostname" => gethostname(),
         "julia_version" => string(VERSION),
-        "cuda_version" => string(CUDA.runtime_version()),
-        "gpu_name" => CUDA.name(CUDA.device()),
-        "gpu_capability" => string(CUDA.capability(CUDA.device())),
+        "backend" => backend,
+        "julia_threads" => Threads.nthreads(),
         "slurm_job_id" => get(ENV, "SLURM_JOB_ID", ""),
         "cuda_visible_devices" => get(ENV, "CUDA_VISIBLE_DEVICES", ""),
     )
+    if backend == "cpu"
+        meta["timer"] = "cpu_ns"
+    elseif backend == "cuda"
+        meta["timer"] = "cuda_event"
+    else
+        meta["timer"] = ka_device !== nothing && nameof(typeof(ka_device)) == :CUDABackend ?
+                        "cuda_event" : "cpu_ns"
+        meta["ka_device"] = string(typeof(ka_device))
+    end
+    if meta["timer"] == "cuda_event"
+        cuda = getfield(Main, :CUDA)
+        meta["cuda_version"] = string(cuda.runtime_version())
+        meta["gpu_name"] = cuda.name(cuda.device())
+        meta["gpu_capability"] = string(cuda.capability(cuda.device()))
+    end
+    return meta
 end
 
 function main()
-    options = parse_args(ARGS)
+    options = OPTIONS
+    backend = BACKEND
+    language = get(options, "language", "julia-$backend")
+    device = get(options, "device", "auto")
     candidate_id = get(options, "candidate-id", "manual")
     output = get(options, "output", joinpath(ROOT, "results", "$candidate_id.json"))
     performance_shapes = parse_shapes(get(options, "shapes", "1024x1024"))
@@ -159,29 +210,43 @@ function main()
             error("dtype must be Float32 or Float64")
     p = GrayScottParams(dtype)
     started = time()
+    evaluator_version = "gray-scott-julia-$(backend)-v1"
 
     result = try
-        CUDA.functional() || error("CUDA is not functional on this host")
+        if backend == "ka"
+            getfield(Main, :CUDA).functional() ||
+                error("KernelAbstractions requires a CUDA GPU")
+            ka_device = select_backend(device)
+        else
+            ka_device = nothing
+        end
+        if backend == "cuda"
+            getfield(Main, :CUDA).functional() || error("CUDA is not functional on this host")
+        end
+
         compile_started = time()
-        compile_state = prepare_candidate(initialize_fields(dtype, (32, 32))...)
+        _, compile_state = make_states(initialize_fields(dtype, (32, 32))..., backend, ka_device)
         run_candidate!(compile_state, p, 1)
-        CUDA.synchronize()
+        synchronize_run(backend, compile_state)
         compile_seconds = time() - compile_started
 
         correct, correctness_cases =
-            candidate_correctness(dtype, correctness_shapes, p, atol, rtol)
+            candidate_correctness(backend, ka_device, dtype, correctness_shapes, p, atol, rtol)
         workloads = correct ? [
-            benchmark_workload(dtype, shape, p, steps, warmups, repetitions, atol, rtol)
+            benchmark_workload(
+                backend, ka_device, dtype, shape, p, steps, warmups, repetitions, atol, rtol,
+            )
             for shape in performance_shapes
         ] : []
         all_correct = correct && all(workload["correct"] for workload in workloads)
         speedup = all_correct && !isempty(workloads) ?
                   exp(mean(log(workload["speedup"]) for workload in workloads)) : nothing
         Dict(
-            "schema_version" => "2.0",
+            "schema_version" => "2.1",
             "candidate_id" => candidate_id,
-            "language" => "julia",
-            "evaluator_version" => "gray-scott-cuda-v1",
+            "language" => language,
+            "backend" => backend,
+            "evaluator_version" => evaluator_version,
             "status" => all_correct ? "passed" : "failed",
             "correct" => all_correct,
             "correctness_cases" => correctness_cases,
@@ -189,23 +254,27 @@ function main()
             "geometric_mean_speedup" => speedup,
             "compile_seconds" => compile_seconds,
             "end_to_end_seconds" => time() - started,
-            "environment" => environment_metadata(),
+            "environment" => environment_metadata(backend, ka_device),
             "error" => nothing,
             "created_at" => string(Dates.now(Dates.UTC)),
         )
     catch exception
         Dict(
-            "schema_version" => "2.0",
+            "schema_version" => "2.1",
             "candidate_id" => candidate_id,
-            "language" => "julia",
-            "evaluator_version" => "gray-scott-cuda-v1",
+            "language" => language,
+            "backend" => backend,
+            "evaluator_version" => evaluator_version,
             "status" => "error",
             "correct" => false,
             "workloads" => [],
             "geometric_mean_speedup" => nothing,
             "compile_seconds" => nothing,
             "end_to_end_seconds" => time() - started,
-            "environment" => Dict{String,String}(),
+            "environment" => Dict{String,Any}(
+                "backend" => backend,
+                "julia_threads" => Threads.nthreads(),
+            ),
             "error" => sprint(showerror, exception, catch_backtrace()),
             "created_at" => string(Dates.now(Dates.UTC)),
         )
@@ -220,5 +289,4 @@ function main()
     result["status"] == "passed" || exit(2)
 end
 
-using Dates
 main()

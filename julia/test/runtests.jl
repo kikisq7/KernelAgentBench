@@ -5,6 +5,26 @@ const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 include(joinpath(ROOT, "kernels", "gray_scott", "reference.jl"))
 using .GrayScottReference
 
+const REQUESTED = isempty(ARGS) ? "all" : ARGS[1]
+const SHAPES = ((31, 29), (64, 64), (127, 65))
+const ATOL = 2f-5
+const RTOL = 2f-4
+
+function check_backend(prepare, run!, fields_fn; prepare_kwargs=NamedTuple())
+    params = GrayScottParams(Float32)
+    for shape in SHAPES
+        u, v = initialize_fields(Float32, shape)
+        expected_u, expected_v = cpu_simulate(u, v, params, 5)
+        state = prepare(u, v; prepare_kwargs...)
+        run!(state, params, 5)
+        actual_u, actual_v = Array.(fields_fn(state))
+        @test actual_u ≈ expected_u atol=ATOL rtol=RTOL
+        @test actual_v ≈ expected_v atol=ATOL rtol=RTOL
+        @test actual_u[[1, end], :] == u[[1, end], :]
+        @test actual_v[:, [1, end]] == v[:, [1, end]]
+    end
+end
+
 @testset "Gray-Scott CPU reference" begin
     params = GrayScottParams(Float32)
     u, v = initialize_fields(Float32, (31, 29))
@@ -24,27 +44,6 @@ using .GrayScottReference
     @test result_v[:, [1, end]] == v[:, [1, end]]
 end
 
-@testset "Gray-Scott candidate" begin
-    if CUDA.functional()
-        include(joinpath(ROOT, "kernels", "gray_scott", "baseline.jl"))
-        include(joinpath(ROOT, "kernels", "gray_scott", "candidate.jl"))
-        params = GrayScottParams(Float32)
-        for shape in ((31, 29), (64, 64), (127, 65))
-            u, v = initialize_fields(Float32, shape)
-            expected_u, expected_v = cpu_simulate(u, v, params, 5)
-            baseline = GrayScottBaseline.prepare_baseline(u, v)
-            GrayScottBaseline.run_baseline!(baseline, params, 5)
-            state = GrayScottCandidate.prepare_candidate(u, v)
-            GrayScottCandidate.run_candidate!(state, params, 5)
-            CUDA.synchronize()
-            baseline_u_gpu, baseline_v_gpu = GrayScottBaseline.baseline_fields(baseline)
-            actual_u_gpu, actual_v_gpu = GrayScottCandidate.candidate_fields(state)
-            @test Array(baseline_u_gpu) ≈ expected_u atol=2f-5 rtol=2f-4
-            @test Array(baseline_v_gpu) ≈ expected_v atol=2f-5 rtol=2f-4
-            @test Array(actual_u_gpu) ≈ expected_u atol=2f-5 rtol=2f-4
-            @test Array(actual_v_gpu) ≈ expected_v atol=2f-5 rtol=2f-4
-        end
-    else
-        @info "CUDA unavailable; candidate GPU tests skipped"
-    end
-end
+REQUESTED in ("all", "cpu") && include("cpu_tests.jl")
+REQUESTED in ("all", "cuda") && include("cuda_tests.jl")
+REQUESTED in ("all", "ka") && include("ka_tests.jl")

@@ -10,11 +10,17 @@ import typer
 from .config import canonical_hash, load_orcd, load_study, project_root
 from .graph import TrialGraph
 from .models import discover_models
-from .orcd import candidate_id, render_slurm, salloc_command, ssh_handoff_commands
+from .orcd import (
+    candidate_id,
+    probe_ssh,
+    render_slurm,
+    ssh_handoff_commands,
+)
 from .records import read_jsonl
 from .schemas import StudyConfig, json_schema_bundle
+from .tracing import configure_tracing
 
-app = typer.Typer(no_args_is_help=True, help="GPU kernel coding-agent benchmark.")
+app = typer.Typer(no_args_is_help=True, help="Julia kernel coding-agent benchmark.")
 
 
 def _study(path: Path | None) -> tuple[Path, StudyConfig]:
@@ -58,8 +64,11 @@ def start(
     orcd_path: Annotated[Path | None, typer.Option("--orcd")] = None,
     baseline_commit: Annotated[str, typer.Option("--baseline")] = "HEAD",
 ) -> None:
+    configure_tracing()
     _, study = _study(study_path)
     orcd = load_orcd(orcd_path) if orcd_path else None
+    if orcd and orcd.auto_evaluate:
+        probe_ssh(orcd)
     resolved = discover_models(study.models)
     if model_alias not in resolved:
         raise typer.BadParameter(f"unknown model alias; choose from {', '.join(resolved)}")
@@ -92,6 +101,7 @@ def matrix(study_path: Annotated[Path | None, typer.Option("--study")] = None) -
         {
             "trial_id": f"{study.study_id}-{language.id}-{model.alias}-r{replicate}",
             "language": language.id,
+            "backend": language.backend,
             "model": model.alias,
             "replicate": replicate,
         }
@@ -107,6 +117,7 @@ def resume(
     trial_id: Annotated[str, typer.Option("--trial")],
     result: Annotated[Path, typer.Option("--result", exists=True, dir_okay=False)],
 ) -> None:
+    configure_tracing()
     runner = TrialGraph(project_root())
     try:
         state = runner.resume(trial_id, result)
@@ -153,13 +164,16 @@ def render_slurm_command(
     )
     output.chmod(0o750)
     typer.echo(output)
-    typer.echo(
-        " ".join(salloc_command(config))
-        + " -- srun --ntasks=1 --gres=gpu:"
-        + config.gpu_request
-        + " bash "
-        + str(output)
-    )
+    typer.echo("sbatch --parsable " + str(output))
+
+
+@app.command("ssh-check")
+def ssh_check(
+    orcd_path: Annotated[Path, typer.Option("--orcd", exists=True, dir_okay=False)],
+) -> None:
+    config = load_orcd(orcd_path)
+    probe_ssh(config)
+    typer.echo(f"ssh ok: {config.ssh_user}@{config.ssh_host}")
 
 
 @app.command("ssh-handoff")

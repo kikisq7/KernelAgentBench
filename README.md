@@ -1,25 +1,38 @@
 # Kernel Agent Bench
 
-Kernel Agent Bench measures how effectively coding agents optimize GPU kernels
-in Julia, Python, and CUDA C++. The first study uses a corrected
-two-dimensional, five-point Gray-Scott solver on one NVIDIA H200. Every one of
-the three models runs against every language, giving nine conditions per
-replicate. KernelAbstractions and AMD are later, separate tracks.
+Kernel Agent Bench measures how effectively coding agents optimize a corrected
+two-dimensional, five-point Gray-Scott solver in **Julia**. The active study
+tests three backends:
+
+1. **CPU** — Polyester.jl threaded loops
+2. **CUDA** — CUDA.jl `@cuda` on one NVIDIA GPU
+3. **KernelAbstractions** — portable `@kernel` on CPU and NVIDIA
+   (`CUDABackend` now; AMD `ROCBackend` later)
+
+KernelAbstractions is the focus track. Python/numba-cuda and CUDA C++ remain
+in the repository but are not part of this study.
+
+Agents still run the existing loop: edit the backend candidate, pass public
+tests, package a patch, evaluate against the same-backend baseline, and stop
+after five tries or when speedup does not improve by at least 5%.
 
 The benchmark has two planes:
 
 - The local control plane runs a checkpointed LangGraph, invokes Cursor coding
-  agents, records patches, and sends traces to LangSmith.
-- The ORCD evaluation plane has no model credentials. It reconstructs a
-  candidate from a baseline commit and patch, checks correctness, and measures
-  baseline and candidate in the same H200 allocation.
+  agents, records patches, and optionally sends traces to LangSmith.
+- GPU evaluation (CUDA.jl and KernelAbstractions on NVIDIA) uses keyed SSH to
+  ORCD. The CPU backend evaluates locally and does not request a GPU.
 
 ## What is measured
 
 Correctness is a hard gate. The primary metric is the geometric mean of
-steady-state timestep speedup over all required grid sizes. CUDA event timing
-excludes package loading, JIT compilation, allocations, and transfers.
-Compilation and end-to-end time are recorded separately.
+steady-state timestep speedup over all required grid sizes. GPU timings use
+CUDA events (`timer: cuda_event`) and exclude package loading, JIT compilation,
+allocations, and host/device transfers. CPU and KernelAbstractions-on-CPU use
+synchronized wall time (`timer: cpu_ns`). Compilation and end-to-end time are
+recorded separately. Each trial uses 3 unscored warmups of 10 steps, then 10
+interleaved 1000-step repetitions; the score is the **median**, not the mean.
+The CPU backend uses smaller grids and fewer reps so local eval stays practical.
 
 The supplied baseline uses separate input and output fields on each timestep.
 This intentionally fixes the source notebook's in-place cross-block data race.
@@ -27,9 +40,8 @@ Initialization is deterministic, boundaries are fixed, and scored computation
 uses `Float32` by default.
 
 Each trial records the resolved model ID, source and prompt hashes, complete
-candidate patch lineage, raw timing samples, H200 environment, H200 evaluation
+candidate patch lineage, raw timing samples, machine environment, evaluation
 count, wall time, and Cursor-reported input/output/cache/reasoning tokens.
-Cursor billed cost is also captured when it has settled.
 
 ## Setup
 
@@ -38,7 +50,7 @@ Requirements:
 - Python 3.11+
 - Julia 1.11
 - Git
-- On ORCD: Julia/CUDA.jl, Python/numba-cuda, and `nvcc`
+- On ORCD, for GPU tracks: Julia with CUDA.jl and KernelAbstractions
 - A Cursor API key with the requested models enabled
 - Optional LangSmith API key
 
@@ -71,29 +83,74 @@ kernel-agent-bench matrix --study config/study.yaml
 ```
 
 Model selectors are matched against the live `Cursor.models.list()` catalog.
-The exact newest Composer, exact GPT-5.6 match, and newest Anthropic/Claude
+The exact newest Composer, exact `gpt-5.6-sol` match, and newest Anthropic/Claude
 match are frozen in trial records. A missing model is an error; it is never
 silently replaced.
 
-## Run the checkpointed loop
+## Test the three Julia backends
+
+Public tests (the CPU backend always runs; CUDA.jl skips if no GPU is present.
+KernelAbstractions **requires** a CUDA GPU and fails if none is found):
+
+```bash
+julia --project=julia julia/test/runtests.jl cpu
+julia --project=julia julia/test/runtests.jl cuda
+julia --project=julia julia/test/runtests.jl ka
+julia --project=julia julia/test/runtests.jl   # all three
+```
+
+Direct evaluator (no agent). CPU does not need a GPU. KernelAbstractions
+`--device auto` requires a CUDA GPU and uses `CUDABackend()`:
+
+```bash
+julia --project=julia julia/evaluate_candidate.jl \
+  --backend cpu \
+  --language julia-cpu \
+  --candidate-id manual-cpu \
+  --output results/manual-cpu.json \
+  --shapes 256x256,512x512 \
+  --steps 50 \
+  --warmups 1 \
+  --repetitions 3
+
+julia --project=julia julia/evaluate_candidate.jl \
+  --backend ka \
+  --language julia-ka \
+  --candidate-id manual-ka \
+  --output results/manual-ka.json \
+  --shapes 64x64 \
+  --steps 5 \
+  --warmups 1 \
+  --repetitions 1
+```
+
+## Run the checkpointed agent loop
 
 The project must be committed before a real trial starts because every trial
-uses a detached worktree at the specified baseline:
+uses a detached worktree at the specified baseline. KernelAbstractions is the
+default focus:
 
 ```bash
 kernel-agent-bench start \
   --study config/study.yaml \
   --model composer \
-  --language python \
+  --language julia-ka \
   --replicate 1 \
   --baseline HEAD
 ```
 
-The graph runs one coding-agent turn, executes public tests, validates that
-only that language's candidate file changed, packages the binary Git patch,
-and stops with status `awaiting_h200_result`. The editable files are
-`kernels/gray_scott/candidate.jl`, `python/gray_scott/candidate.py`, and
-`cpp/gray_scott/candidate.cuh`.
+`--language` is one of `julia-ka`, `julia-cuda`, or `julia-cpu`. The graph runs
+one coding-agent turn, executes that backend's public tests, validates that
+only that backend's candidate file changed, packages the binary Git patch, and
+either evaluates or stops with status `awaiting_h200_result`.
+
+Editable files:
+
+- `kernels/gray_scott/ka/candidate.jl`
+- `kernels/gray_scott/cuda/candidate.jl`
+- `kernels/gray_scott/cpu/candidate.jl`
+
+The agent cwd is a temp copy of that backend's `workspace_paths` only.
 
 List bundles that do not yet have ingested results:
 
@@ -101,28 +158,27 @@ List bundles that do not yet have ingested results:
 kernel-agent-bench pending
 ```
 
-After H200 evaluation, resume the same checkpoint:
+After GPU evaluation, resume the same checkpoint:
 
 ```bash
 kernel-agent-bench resume \
-  --trial gray-scott-cuda-h200-v1-python-composer-r1 \
+  --trial gray-scott-julia-backends-v1-julia-ka-composer-r1 \
   --result results/CANDIDATE_ID.json
 ```
 
-Each trial is capped at **five** agent turns and **five** H200 evaluations.
+Each trial is capped at **five** agent turns and **five** scored evaluations.
 The graph keeps the best correct incumbent and continues only when geometric-mean
 speedup improves by at least 5% over that incumbent (or over 1.0× on the first
 try). A correct candidate that is slower, equal, or only marginally faster ends
-the trial early with `no_significant_improvement`, so a plateau uses fewer than
-five GPU jobs. Incorrect candidates may still be repaired until the cap.
+the trial early with `no_significant_improvement`. Incorrect candidates may
+still be repaired until the cap. `julia-cpu` evaluations run locally.
 
-## ORCD H200
+## ORCD H200 (CUDA.jl and KernelAbstractions GPU)
 
-The H200 is requested with keyed SSH and:
-
-```bash
-salloc -N 1 -n 32 --cpus-per-task=1 --mem=128GB --time=06:00:00 -G h200:1
-```
+The H200 is requested with keyed SSH. The laptop submits with `sbatch` and
+only polls `squeue`; it does not hold `salloc` over SSH. The job asks for
+1 node, 1 CPU, 8GB, 20 minutes, and `h200:1`. To reuse an existing
+allocation, start `salloc` yourself and set `salloc_job_id`.
 
 Fill `config/orcd.yaml`:
 
@@ -130,10 +186,13 @@ Fill `config/orcd.yaml`:
   ORCD clone of `KernelAgentBench`.
 - `scratch_root`: node-visible scratch for temporary worktrees.
 - `identity_file`: only if the key is not the default SSH identity.
+  ORCD login is usually Kerberos + Duo. Run
+  `kernel-agent-bench ssh-check --orcd config/orcd.yaml` once from a
+  terminal; later rsync reuses that `ControlPersist` socket.
 - `salloc_job_id`: set this if you already hold an `salloc`, so later evals
   use `srun` on that job instead of allocating again.
-- `auto_evaluate`: `true` (default) folds rsync + `salloc`/`srun` + result
-  download into the LangGraph loop.
+- `auto_evaluate`: `true` (default) folds rsync + `sbatch` + short `squeue`
+  polls + result download into the LangGraph loop.
 - `remote_project` must be the absolute `KernelAgentBench` directory. Transfers
   never touch the rest of the ORCD clone or your home directory.
 
@@ -143,51 +202,21 @@ Download copies only `$remote_project/results/<candidate_id>.json` onto the
 matching local file. There is no `--delete`, and the persistent kernels,
 baselines, git checkout, and other candidate directories are not synced.
 
-One-time remote setup:
-
-```bash
-ssh YOUR_USER@orcd-login.mit.edu
-git clone YOUR_REPOSITORY_URL /path/to/UROPJulia
-cd /path/to/UROPJulia/KernelAgentBench
-# create .venv, pip install -e '.[gpu]', instantiate Julia
-```
-
-With keyed SSH and `auto_evaluate: true`, start the full loop from your laptop:
+With keyed SSH and `auto_evaluate: true`, start the KernelAbstractions GPU loop:
 
 ```bash
 kernel-agent-bench start \
   --study config/study.yaml \
   --orcd config/orcd.yaml \
   --model composer \
-  --language julia \
+  --language julia-ka \
   --replicate 1 \
   --baseline HEAD
 ```
 
-That command is the closed laptop→H200 loop for one Julia/Composer replicate:
-
-1. Loads `config/study.yaml` and `config/orcd.yaml`.
-2. Resolves `composer` against the live Cursor model catalog.
-3. Creates a detached local git worktree at `--baseline HEAD`.
-4. Runs the Cursor agent in that worktree with the Julia prompt. The agent
-   may edit only `kernels/gray_scott/candidate.jl`.
-5. Runs the public Julia tests. Illegal path changes or a failed test retry
-   the agent, up to five turns.
-6. Packages a patch + manifest under `candidates/<id>/`.
-7. Rsyncs **only that folder** to
-   `$remote_project/candidates/<id>/` (no `--delete`, repo untouched).
-8. Over SSH, writes one sbatch file and runs
-   `salloc -N 1 -n 32 --cpus-per-task=1 --mem=128GB --time=06:00:00 -G h200:1 -- srun ...`.
-   The job makes a scratch worktree of the existing ORCD clone, applies the
-   patch, and writes `$remote_project/results/<id>.json`.
-9. Rsyncs that one JSON file back, ingests it, and either asks the agent to
-   try again or stops under the 5-try / 5% rule.
-
 `config/study.yaml` and `config/orcd.yaml` must exist (copy the example
 files). The project must be committed so `--baseline HEAD` is a real commit.
 The ORCD clone must already contain that commit.
-To reuse one six-hour allocation across those evals, start `salloc` yourself,
-put the job id in `salloc_job_id`, then start the trial.
 
 Manual fallback (`auto_evaluate: false`) still prints the same commands:
 
@@ -199,29 +228,6 @@ On the login node you can also run:
 
 ```bash
 scripts/submit_h200.sh config/orcd.yaml candidates/CANDIDATE_ID
-```
-
-Run a language evaluator directly for diagnostics:
-
-```bash
-julia --project=julia julia/evaluate_candidate.jl \
-  --candidate-id manual \
-  --output results/manual.json \
-  --shapes 1024x1024,2048x2048,4096x4096 \
-  --steps 1000 \
-  --warmups 3 \
-  --repetitions 10
-
-python3 python/evaluate_candidate.py \
-  --candidate-id manual-python \
-  --output results/manual-python.json \
-  --shapes 1024x1024,2048x2048,4096x4096
-
-nvcc -O3 -std=c++17 cpp/evaluate_candidate.cu -o /tmp/evaluate-gray-scott
-/tmp/evaluate-gray-scott \
-  --candidate-id manual-cpp \
-  --output results/manual-cpp.json \
-  --shapes 1024x1024,2048x2048,4096x4096
 ```
 
 ## Tracing and privacy
@@ -242,8 +248,6 @@ unavailable rather than estimated.
 ruff check .
 mypy src
 pytest
-pytest python/tests
-bash cpp/test/run_cpu_tests.sh
 julia --project=julia julia/test/runtests.jl
 ```
 
@@ -261,12 +265,8 @@ or archive them deliberately when a study must be retained.
 
 ## Study rollout
 
-1. Run the unchanged baseline repeatedly on H200 and verify timing variance.
-2. Complete one trial with one model and one language.
-3. Let the graph stop at five H200 evaluations or earlier when speedup does not
-   improve by at least 5%.
-4. Run the full Julia/Python/C++ × Composer/GPT-5.6/Anthropic matrix with at
-   least three independent replicates and identical budgets.
-5. Add a KernelAbstractions baseline only after the CUDA study is stable.
-6. Add AMD after hardware and the portability-versus-peak-performance objective
-   are specified.
+1. Test CPU, CUDA.jl, and KernelAbstractions locally (`runtests.jl`).
+2. Time the unchanged KernelAbstractions baseline on NVIDIA (H200) and on CPU.
+3. Run agent trials with `--language julia-ka` (focus). Same 5-try / 5% loop.
+4. Compare CUDA.jl and CPU cells against the KernelAbstractions result.
+5. Add AMD/`ROCBackend` when that hardware track is specified.

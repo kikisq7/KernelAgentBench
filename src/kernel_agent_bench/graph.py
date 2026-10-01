@@ -15,7 +15,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .candidates import CandidateManager, Worktree
 from .models import AgentRun, run_cursor_agent
-from .orcd import evaluate_candidate_remote
+from .orcd import evaluate_candidate_local, evaluate_candidate_remote
 from .records import append_jsonl, sha256_file
 from .schemas import (
     EvaluationResult,
@@ -29,6 +29,7 @@ from .tracing import add_trace_outputs, trace_span
 
 ModelRunner = Callable[[str, Path, str], AgentRun]
 EvaluateRunner = Callable[[OrcdConfig, Path, Path], Path]
+LocalEvaluateRunner = Callable[[Path, Path, Path], Path]
 
 
 class TrialState(TypedDict, total=False):
@@ -45,6 +46,7 @@ class TrialState(TypedDict, total=False):
     baseline_commit: str
     worktree_root: str
     workspace: str
+    agent_workspace: str
     status: str
     iteration: int
     h200_evaluations: int
@@ -89,12 +91,14 @@ class TrialGraph:
         *,
         model_runner: ModelRunner = run_cursor_agent,
         evaluate_runner: EvaluateRunner = evaluate_candidate_remote,
+        local_evaluate_runner: LocalEvaluateRunner = evaluate_candidate_local,
         checkpoint_path: Path | None = None,
     ) -> None:
         self.project = project.resolve()
         self.manager = CandidateManager(self.project)
         self.model_runner = model_runner
         self.evaluate_runner = evaluate_runner
+        self.local_evaluate_runner = local_evaluate_runner
         checkpoint = checkpoint_path or self.project / ".kernel-agent-bench" / "checkpoints.sqlite"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(checkpoint, check_same_thread=False)
@@ -169,7 +173,11 @@ class TrialGraph:
 
     @staticmethod
     def _route_after_package(state: TrialState) -> str:
-        return "evaluate_h200" if state.get("auto_evaluate") else "wait"
+        study = StudyConfig.model_validate(state["study"])
+        target = TrialGraph._target(study, state["language"])
+        if target.evaluate_locally or state.get("auto_evaluate"):
+            return "evaluate_h200"
+        return "wait"
 
     def _metadata(self, state: TrialState) -> dict[str, Any]:
         return {
@@ -192,50 +200,71 @@ class TrialGraph:
 
     def _run_agent(self, state: TrialState) -> dict[str, Any]:
         study = StudyConfig.model_validate(state["study"])
+        target = self._target(study, state["language"])
+        worktree = self._worktree(state)
+        previous_agent = state.get("agent_workspace")
+        if previous_agent:
+            self.manager.cleanup_agent_workspace(Path(previous_agent), worktree.project)
+        agent_workspace = self.manager.materialize_agent_workspace(
+            worktree,
+            target.workspace_paths,
+            state["trial_id"],
+        )
         feedback = ""
         if state.get("evaluation"):
-            feedback = "\n\nPrevious H200 evaluation:\n" + json.dumps(
+            feedback = "\n\nPrevious evaluation:\n" + json.dumps(
                 state["evaluation"], sort_keys=True, indent=2
             )
         if state.get("last_feedback"):
             feedback += "\n\nLocal validation feedback:\n" + state["last_feedback"]
         prompt = state["prompt"] + feedback
-        with trace_span(
-            "cursor_coding_agent",
-            inputs={"prompt": prompt, "workspace": state["workspace"]},
-            metadata=self._metadata(state),
-            include_content=study.trace_content,
-            run_type="llm",
-        ) as span:
-            run = self.model_runner(
-                state["resolved_model_id"],
-                Path(state["workspace"]),
-                prompt,
-            )
-            cumulative = _sum_tokens(state.get("token_usage", {}), run.usage)
-            outputs = {
-                "status": run.status,
-                "response": run.response,
-                "agent_id": run.agent_id,
-                "run_id": run.run_id,
-                "token_usage": run.usage.model_dump(),
-                "cost": run.cost,
-            }
-            if span is not None:
-                span.add_metadata(
-                    {
-                        "token_input": run.usage.input_tokens,
-                        "token_output": run.usage.output_tokens,
-                        "token_cache_read": run.usage.cache_read_tokens,
-                        "token_cache_write": run.usage.cache_write_tokens,
-                        "token_total": run.usage.total_tokens,
-                        "token_reasoning": run.usage.reasoning_tokens,
-                        "token_usage_available": run.usage.available,
-                    }
+        try:
+            with trace_span(
+                "cursor_coding_agent",
+                inputs={"prompt": prompt, "workspace": str(agent_workspace)},
+                metadata=self._metadata(state),
+                include_content=study.trace_content,
+                run_type="llm",
+            ) as span:
+                run = self.model_runner(
+                    state["resolved_model_id"],
+                    agent_workspace,
+                    prompt,
                 )
-            add_trace_outputs(span, outputs, study.trace_content)
-        if run.status not in {"finished", "success"}:
-            raise RuntimeError(f"Cursor run failed with status {run.status}: {run.response}")
+                cumulative = _sum_tokens(state.get("token_usage", {}), run.usage)
+                outputs = {
+                    "status": run.status,
+                    "response": run.response,
+                    "agent_id": run.agent_id,
+                    "run_id": run.run_id,
+                    "token_usage": run.usage.model_dump(),
+                    "cost": run.cost,
+                }
+                if span is not None:
+                    span.add_metadata(
+                        {
+                            "token_input": run.usage.input_tokens,
+                            "token_output": run.usage.output_tokens,
+                            "token_cache_read": run.usage.cache_read_tokens,
+                            "token_cache_write": run.usage.cache_write_tokens,
+                            "token_total": run.usage.total_tokens,
+                            "token_reasoning": run.usage.reasoning_tokens,
+                            "token_usage_available": run.usage.available,
+                        }
+                    )
+                add_trace_outputs(span, outputs, study.trace_content)
+            if run.status not in {"finished", "success"}:
+                raise RuntimeError(
+                    f"Cursor run failed with status {run.status}: {run.response}"
+                )
+            self.manager.sync_editable_from_agent(
+                worktree,
+                agent_workspace,
+                target.editable_paths,
+            )
+        except Exception:
+            self.manager.cleanup_agent_workspace(agent_workspace, worktree.project)
+            raise
         return {
             "status": "checking",
             "response": run.response,
@@ -244,6 +273,7 @@ class TrialGraph:
             "billed_cost": run.cost,
             "token_usage": cumulative.model_dump(),
             "total_tokens": cumulative.total_tokens,
+            "agent_workspace": str(agent_workspace),
         }
 
     def _public_checks(self, state: TrialState) -> dict[str, Any]:
@@ -316,7 +346,7 @@ class TrialGraph:
                 study.task_version,
                 state["study_hash"],
                 state["prompt"],
-                study.evaluation,
+                target.evaluation or study.evaluation,
             )
             add_trace_outputs(
                 span,
@@ -347,30 +377,41 @@ class TrialGraph:
         }
 
     def _evaluate_h200(self, state: TrialState) -> dict[str, Any]:
-        if not state.get("orcd"):
-            raise ValueError("auto H200 evaluation requires an ORCD config")
-        orcd = OrcdConfig.model_validate(state["orcd"])
         study = StudyConfig.model_validate(state["study"])
+        target = self._target(study, state["language"])
+        if target.evaluate_locally:
+            with trace_span(
+                "evaluate_local",
+                inputs={"candidate_id": state["candidate_id"], "backend": target.backend},
+                metadata=self._metadata(state),
+                include_content=study.trace_content,
+                run_type="tool",
+            ) as span:
+                result_path = self.local_evaluate_runner(
+                    self.project,
+                    Path(state["workspace"]),
+                    Path(state["candidate_bundle"]),
+                )
+                add_trace_outputs(
+                    span,
+                    {"result_path": str(result_path)},
+                    study.trace_content,
+                )
+            return {
+                "status": "awaiting_h200_result",
+                "evaluation_result_path": str(result_path),
+            }
+        if not state.get("orcd"):
+            raise ValueError("auto GPU evaluation requires an ORCD config")
+        orcd = OrcdConfig.model_validate(state["orcd"])
         with trace_span(
             "evaluate_h200",
             inputs={
                 "candidate_id": state["candidate_id"],
-                "salloc": " ".join(
-                    [
-                        "salloc",
-                        "-N",
-                        str(orcd.nodes),
-                        "-n",
-                        str(orcd.ntasks),
-                        "--cpus-per-task",
-                        str(orcd.cpus_per_task),
-                        "--mem",
-                        orcd.memory,
-                        "--time",
-                        orcd.wall_time,
-                        "-G",
-                        orcd.gpu_request,
-                    ]
+                "eval": (
+                    f"srun --jobid={orcd.salloc_job_id}"
+                    if orcd.salloc_job_id
+                    else "sbatch --parsable"
                 ),
             },
             metadata=self._metadata(state),
@@ -521,6 +562,11 @@ class TrialGraph:
             metadata={"study_hash": state["study_hash"], "graph_hash": state["graph_hash"]},
         )
         append_jsonl(self.project / "results" / "trials.jsonl", record)
+        if state.get("agent_workspace"):
+            self.manager.cleanup_agent_workspace(
+                Path(state["agent_workspace"]),
+                Path(state["workspace"]),
+            )
         self.manager.cleanup_worktree(Path(state["worktree_root"]))
         return {"status": "finished"}
 

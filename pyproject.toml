@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "kernel-agent-bench"
 version = "0.1.0"
-description = "Reproducible coding-agent evaluation for Julia GPU kernels"
+description = "Reproducible coding-agent evaluation for Julia CPU, CUDA.jl, and KernelAbstractions kernels"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
