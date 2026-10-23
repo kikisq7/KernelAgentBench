@@ -24,6 +24,7 @@ from .schemas import (
     StudyConfig,
     TokenRecord,
     TrialRecord,
+    is_julia_language,
 )
 from .tracing import add_trace_outputs, trace_span
 
@@ -82,6 +83,24 @@ def _sum_tokens(current: dict[str, Any], new: TokenRecord) -> TokenRecord:
         reasoning_tokens=(previous.reasoning_tokens or 0) + (new.reasoning_tokens or 0),
         available=previous.available and new.available,
     )
+
+
+def _evaluation_for_agent_feedback(evaluation: dict[str, Any]) -> dict[str, Any]:
+    """Drop raw timing samples and bulky metadata from prompts; keep scored summaries."""
+    slim = dict(evaluation)
+    raw_samples = {"baseline_samples_ms", "candidate_samples_ms"}
+    slim["workloads"] = [
+        {k: v for k, v in workload.items() if k not in raw_samples}
+        for workload in slim.get("workloads", [])
+    ]
+    env = slim.get("environment")
+    if isinstance(env, dict):
+        slim["environment"] = {
+            key: env[key]
+            for key in ("backend", "timer", "gpu_name", "julia_threads")
+            if key in env
+        }
+    return slim
 
 
 class TrialGraph:
@@ -213,7 +232,9 @@ class TrialGraph:
         feedback = ""
         if state.get("evaluation"):
             feedback = "\n\nPrevious evaluation:\n" + json.dumps(
-                state["evaluation"], sort_keys=True, indent=2
+                _evaluation_for_agent_feedback(state["evaluation"]),
+                sort_keys=True,
+                indent=2,
             )
         if state.get("last_feedback"):
             feedback += "\n\nLocal validation feedback:\n" + state["last_feedback"]
@@ -404,6 +425,13 @@ class TrialGraph:
         if not state.get("orcd"):
             raise ValueError("auto GPU evaluation requires an ORCD config")
         orcd = OrcdConfig.model_validate(state["orcd"])
+        disk = self.project / "config" / "orcd.yaml"
+        if disk.is_file():
+            from .config import load_orcd
+
+            held = load_orcd(disk).salloc_job_id.strip()
+            if held:
+                orcd = orcd.model_copy(update={"salloc_job_id": held})
         with trace_span(
             "evaluate_h200",
             inputs={
@@ -453,6 +481,16 @@ class TrialGraph:
                 raise ValueError(
                     f"result language {result.language} does not match {state['language']}"
                 )
+            if result.status != "error" and is_julia_language(result.language):
+                target = self._target(study, state["language"])
+                expected = (target.evaluation or study.evaluation).correctness_dtypes
+                seen = {case.get("dtype") for case in result.correctness_cases}
+                missing = sorted(set(expected) - seen)
+                if missing:
+                    raise ValueError(
+                        f"result has no {', '.join(missing)} correctness cases; "
+                        f"{result.evaluator_version} predates the study's evaluator"
+                    )
             result_hash = sha256_file(path)
             evaluation = result.model_dump(mode="json")
             evaluation["result_sha256"] = result_hash
@@ -485,7 +523,8 @@ class TrialGraph:
         improved = False
         if evaluation.correct and evaluation.geometric_mean_speedup is not None:
             reference = incumbent_speedup if incumbent_speedup is not None else 1.0
-            required = reference * (1 + study.evaluation.min_relative_improvement)
+            evaluation_config = target.evaluation or study.evaluation
+            required = reference * (1 + evaluation_config.min_relative_improvement)
             if incumbent_speedup is None:
                 if evaluation.geometric_mean_speedup >= 1.0:
                     incumbent_speedup = evaluation.geometric_mean_speedup

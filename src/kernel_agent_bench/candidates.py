@@ -10,6 +10,8 @@ from pathlib import Path
 
 from .schemas import CandidateManifest, EvaluationConfig, ensure_relative_paths
 
+TRIAL_INPUT_PATHS = ("kernels", "julia", "prompts")
+
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -43,7 +45,24 @@ class CandidateManager:
         self.worktrees = self.state_root / "worktrees"
         self.bundles = self.project / "candidates"
 
+    def require_committed(self, paths: tuple[str, ...] = TRIAL_INPUT_PATHS) -> None:
+        """Trials run the committed tree, so local edits here would be silently ignored."""
+        existing = [path for path in paths if (self.project / path).exists()]
+        if not existing:
+            return
+        output = _git(
+            self.project, "status", "--porcelain", "--untracked-files=all", "--", *existing
+        ).stdout
+        dirty = sorted(line[3:] for line in output.splitlines() if len(line) >= 4)
+        if dirty:
+            raise RuntimeError(
+                "commit (and push, for ORCD) these trial inputs first; trials run the "
+                "committed baseline and would ignore them: " + ", ".join(dirty)
+            )
+
     def create_worktree(self, trial_id: str, baseline_commit: str = "HEAD") -> Worktree:
+        if baseline_commit == "HEAD":
+            self.require_committed()
         resolved_commit = _git(self.repository, "rev-parse", baseline_commit).stdout.strip()
         destination = self.worktrees / trial_id
         if destination.exists():

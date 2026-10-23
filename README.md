@@ -83,8 +83,8 @@ kernel-agent-bench matrix --study config/study.yaml
 ```
 
 Model selectors are matched against the live `Cursor.models.list()` catalog.
-The exact newest Composer, exact `gpt-5.6-sol` match, and newest Anthropic/Claude
-match are frozen in trial records. A missing model is an error; it is never
+The study pins `claude-opus-5-5`, `gpt-6-astra`, and `composer-2.5` exactly; the
+resolved IDs are frozen in trial records. A missing model is an error; it is never
 silently replaced.
 
 ## Test the three Julia backends
@@ -133,7 +133,7 @@ default focus:
 ```bash
 kernel-agent-bench start \
   --study config/study.yaml \
-  --model composer \
+  --model composer-2.5 \
   --language julia-ka \
   --replicate 1 \
   --baseline HEAD
@@ -162,7 +162,7 @@ After GPU evaluation, resume the same checkpoint:
 
 ```bash
 kernel-agent-bench resume \
-  --trial gray-scott-julia-backends-v1-julia-ka-composer-r1 \
+  --trial gray-scott-julia-backends-v2-julia-ka-composer-2.5-r1 \
   --result results/CANDIDATE_ID.json
 ```
 
@@ -208,7 +208,7 @@ With keyed SSH and `auto_evaluate: true`, start the KernelAbstractions GPU loop:
 kernel-agent-bench start \
   --study config/study.yaml \
   --orcd config/orcd.yaml \
-  --model composer \
+  --model composer-2.5 \
   --language julia-ka \
   --replicate 1 \
   --baseline HEAD

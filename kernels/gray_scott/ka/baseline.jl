@@ -5,6 +5,9 @@ using ..GrayScottKABackend
 
 export baseline_fields, prepare_baseline, run_baseline!
 
+# Match kernels/gray_scott/cuda/baseline.jl: 16×16 tiles over the full grid.
+const BASELINE_TILE = (16, 16)
+
 mutable struct BaselineState{B,A}
     backend::B
     u::A
@@ -41,9 +44,18 @@ end
     end
 end
 
+function baseline_launch_kwargs(backend, height::Int, width::Int)
+    ndrange = (height, width)
+    if backend isa CPU
+        return ndrange, NamedTuple()
+    end
+    return ndrange, (workgroupsize=BASELINE_TILE,)
+end
+
 function run_baseline!(state::BaselineState, p, steps::Int)
     kernel! = baseline_kernel!(state.backend)
-    ndrange = size(state.u)
+    height, width = size(state.u)
+    ndrange, launch_kwargs = baseline_launch_kwargs(state.backend, height, width)
     for _ in 1:steps
         kernel!(
             state.u_next,
@@ -56,11 +68,12 @@ function run_baseline!(state::BaselineState, p, steps::Int)
             p.kill,
             p.dt;
             ndrange,
+            launch_kwargs...,
         )
-        KernelAbstractions.synchronize(state.backend)
         state.u, state.u_next = state.u_next, state.u
         state.v, state.v_next = state.v_next, state.v
     end
+    KernelAbstractions.synchronize(state.backend)
     return state
 end
 

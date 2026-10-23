@@ -69,9 +69,11 @@ def start(
     orcd = load_orcd(orcd_path) if orcd_path else None
     if orcd and orcd.auto_evaluate:
         probe_ssh(orcd)
-    resolved = discover_models(study.models)
-    if model_alias not in resolved:
-        raise typer.BadParameter(f"unknown model alias; choose from {', '.join(resolved)}")
+    selectors = [model for model in study.models if model.alias == model_alias]
+    if not selectors:
+        aliases = ", ".join(model.alias for model in study.models)
+        raise typer.BadParameter(f"unknown model alias; choose from {aliases}")
+    resolved = discover_models(selectors)
     language_ids = {target.id for target in study.languages}
     if language not in language_ids:
         raise typer.BadParameter(f"unknown language; choose from {', '.join(sorted(language_ids))}")

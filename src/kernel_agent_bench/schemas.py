@@ -44,6 +44,13 @@ class EvaluationConfig(StrictModel):
     rtol: float = Field(ge=0)
     max_regression_fraction: float = Field(ge=0, lt=1)
     min_relative_improvement: float = Field(ge=0, lt=1)
+    # Correctness runs in every listed precision; timing uses `dtype` only.
+    # `atol`/`rtol` apply to Float32 and `float64_atol`/`float64_rtol` to Float64.
+    correctness_dtypes: list[Literal["Float32", "Float64"]] = Field(
+        default_factory=lambda: ["Float32", "Float64"], min_length=1
+    )
+    float64_atol: float = Field(default=1e-12, ge=0)
+    float64_rtol: float = Field(default=1e-10, ge=0)
 
 
 def _path_covered(needed: str, allowed: str) -> bool:

@@ -7,21 +7,26 @@ using .GrayScottReference
 
 const REQUESTED = isempty(ARGS) ? "all" : ARGS[1]
 const SHAPES = ((31, 29), (64, 64), (127, 65))
-const ATOL = 2f-5
-const RTOL = 2f-4
+# Matches the evaluator defaults: (atol, rtol) per precision.
+const TOLERANCES = (Float32 => (2e-5, 2e-4), Float64 => (1e-12, 1e-10))
 
 function check_backend(prepare, run!, fields_fn; prepare_kwargs=NamedTuple())
-    params = GrayScottParams(Float32)
-    for shape in SHAPES
-        u, v = initialize_fields(Float32, shape)
-        expected_u, expected_v = cpu_simulate(u, v, params, 5)
-        state = prepare(u, v; prepare_kwargs...)
-        run!(state, params, 5)
-        actual_u, actual_v = Array.(fields_fn(state))
-        @test actual_u ≈ expected_u atol=ATOL rtol=RTOL
-        @test actual_v ≈ expected_v atol=ATOL rtol=RTOL
-        @test actual_u[[1, end], :] == u[[1, end], :]
-        @test actual_v[:, [1, end]] == v[:, [1, end]]
+    for (T, (atol, rtol)) in TOLERANCES
+        params = GrayScottParams(T)
+        for shape in SHAPES
+            u, v = initialize_fields(T, shape)
+            expected_u, expected_v = cpu_simulate(u, v, params, 5)
+            state = prepare(copy(u), copy(v); prepare_kwargs...)
+            run!(state, params, 5)
+            actual_u, actual_v = Array.(fields_fn(state))
+            @test eltype(actual_u) == T && eltype(actual_v) == T
+            @test actual_u ≈ expected_u atol=atol rtol=rtol
+            @test actual_v ≈ expected_v atol=atol rtol=rtol
+            for (actual, initial) in ((actual_u, u), (actual_v, v))
+                @test actual[[1, end], :] == initial[[1, end], :]
+                @test actual[:, [1, end]] == initial[:, [1, end]]
+            end
+        end
     end
 end
 

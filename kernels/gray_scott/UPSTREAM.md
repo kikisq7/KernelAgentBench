@@ -20,3 +20,15 @@ contract:
 
 These corrections are part of the supplied baseline. Agents are evaluated on
 optimization, not on discovering the source notebook's race.
+
+## Julia backend baselines
+
+- `cuda/baseline.jl` is the corrected CUDA.jl transcription of the tutorial
+  kernel (`@cuda`, 16×16 thread blocks, full-grid launch, interior `if` guard).
+- `ka/baseline.jl` is the **KernelAbstractions port of that same baseline**,
+  not a separate algorithm: identical stencil and boundaries, full `ndrange`,
+  `workgroupsize=(16, 16)` on GPU backends, and the same host timestep loop
+  (buffer swap each step; one backend synchronize after all steps, matching the
+  CUDA baseline’s lack of per-step device sync).
+- `cpu/baseline.jl` is the CPU/Polyester track; it shares the same numerical
+  contract via `reference.jl`.

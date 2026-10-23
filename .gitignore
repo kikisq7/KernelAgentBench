@@ -1,6 +1,12 @@
 .env
 .venv/
 /KernelAgentBench/
+.DS_Store
+
+# Local copies of example configs (may contain host paths / job ids).
+config/study.yaml
+config/orcd.yaml
+
 __pycache__/
 .pytest_cache/
 .ruff_cache/

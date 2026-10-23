@@ -5,10 +5,9 @@ using ..GrayScottKABackend
 
 export candidate_fields, prepare_candidate, run_candidate!
 
-# This file is the only source file coding agents may edit for KernelAbstractions.
-# The initial candidate intentionally matches the trusted corrected baseline.
-# The same kernel must remain valid on CPU and NVIDIA GPU (CUDABackend), and
-# must not use CUDA-only intrinsics that would block a later ROCBackend/AMD path.
+# Initial candidate matches kernels/gray_scott/ka/baseline.jl (CUDA-equivalent launch).
+const BASELINE_TILE = (16, 16)
+
 mutable struct CandidateState{B,A}
     backend::B
     u::A
@@ -45,9 +44,18 @@ end
     end
 end
 
+function candidate_launch_kwargs(backend, height::Int, width::Int)
+    ndrange = (height, width)
+    if backend isa CPU
+        return ndrange, NamedTuple()
+    end
+    return ndrange, (workgroupsize=BASELINE_TILE,)
+end
+
 function run_candidate!(state::CandidateState, p, steps::Int)
     kernel! = candidate_kernel!(state.backend)
-    ndrange = size(state.u)
+    height, width = size(state.u)
+    ndrange, launch_kwargs = candidate_launch_kwargs(state.backend, height, width)
     for _ in 1:steps
         kernel!(
             state.u_next,
@@ -60,11 +68,12 @@ function run_candidate!(state::CandidateState, p, steps::Int)
             p.kill,
             p.dt;
             ndrange,
+            launch_kwargs...,
         )
-        KernelAbstractions.synchronize(state.backend)
         state.u, state.u_next = state.u_next, state.u
         state.v, state.v_next = state.v_next, state.v
     end
+    KernelAbstractions.synchronize(state.backend)
     return state
 end
 

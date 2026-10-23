@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import re
 import shlex
@@ -123,7 +124,12 @@ def _directive(name: str, value: str) -> str:
     return f"#SBATCH --{name}={value}" if value else ""
 
 
-def salloc_command(config: OrcdConfig) -> list[str]:
+HOLD_WALL_TIME = "04:00:00"
+HOLD_JOB_NAME = "kab-h200-hold"
+_HOLD_STATES = {"PENDING", "RUNNING", "CONFIGURING", "REQUEUED"}
+
+
+def salloc_command(config: OrcdConfig, *, wall_time: str | None = None) -> list[str]:
     command = [
         "salloc",
         "-N",
@@ -135,7 +141,7 @@ def salloc_command(config: OrcdConfig) -> list[str]:
         "--mem",
         config.memory,
         "--time",
-        config.wall_time,
+        wall_time or config.wall_time,
         "-G",
         config.gpu_request,
     ]
@@ -297,6 +303,14 @@ def remote_mkdir_command(transfer: RemoteTransfer) -> str:
     )
 
 
+def remote_commit_command(transfer: RemoteTransfer, commit: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+        raise ValueError(f"baseline_commit must be a hex SHA: {commit!r}")
+    repo = shlex.quote(str(transfer.remote_project))
+    has = f"git -C {repo} cat-file -e {commit}^{{commit}}"
+    return f"{has} 2>/dev/null || {{ git -C {repo} fetch --quiet origin && {has}; }}"
+
+
 def _run(command: list[str], *, input_text: str | None = None) -> None:
     completed = subprocess.run(
         command,
@@ -339,7 +353,20 @@ def manifest_evaluator_args(manifest: CandidateManifest, output: Path) -> list[s
     ]
     backend = julia_backend_for_language(manifest.language)
     if backend is not None:
-        args.extend(["--language", manifest.language, "--backend", backend])
+        args.extend(
+            [
+                "--language",
+                manifest.language,
+                "--backend",
+                backend,
+                "--correctness-dtypes",
+                ",".join(manifest.evaluation.correctness_dtypes),
+                "--atol64",
+                str(manifest.evaluation.float64_atol),
+                "--rtol64",
+                str(manifest.evaluation.float64_rtol),
+            ]
+        )
     return args
 
 
@@ -557,6 +584,81 @@ def _parse_sbatch_job_id(output: str) -> str:
     return job_id
 
 
+def _parse_salloc_job_id(output: str) -> str:
+    for line in output.splitlines():
+        match = re.search(r"(?:Pending job allocation|Granted job allocation)\s+(\d+)", line)
+        if match:
+            return match.group(1)
+    raise RuntimeError(f"salloc did not print a job id: {output!r}")
+
+
+def persist_salloc_job_id(local_project: Path, job_id: str) -> None:
+    path = local_project / "config" / "orcd.yaml"
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    replacement = f'salloc_job_id: "{job_id}"'
+    updated, count = re.subn(r"^salloc_job_id:\s*.*$", replacement, text, count=1, flags=re.M)
+    if count == 0:
+        updated = text.rstrip() + "\n" + replacement + "\n"
+    path.write_text(updated, encoding="utf-8")
+
+
+def slurm_job_state(config: OrcdConfig, job_id: str) -> str:
+    if not job_id:
+        return ""
+    try:
+        output = _ssh_stdout(config, f"squeue -j {shlex.quote(job_id)} -h -o %T")
+    except RuntimeError as exc:
+        if "Invalid job id" in str(exc) or "slurm_load_jobs error" in str(exc):
+            return ""
+        raise
+    return output.split()[0] if output else ""
+
+
+def _submit_held_salloc(config: OrcdConfig) -> str:
+    alloc = salloc_command(config, wall_time=HOLD_WALL_TIME)
+    alloc[1:1] = ["--no-shell", "--job-name", HOLD_JOB_NAME]
+    remote = (
+        "set -euo pipefail; "
+        'LOG="${HOME}/kab-salloc-h200.log"; '
+        ': > "$LOG"; '
+        "nohup "
+        + " ".join(shlex.quote(part) for part in alloc)
+        + ' >"$LOG" 2>&1 & '
+        "for _ in $(seq 1 40); do "
+        '  if grep -E "job allocation [0-9]+" "$LOG" >/dev/null 2>&1; then break; fi; '
+        "  sleep 0.25; "
+        "done; "
+        'cat "$LOG"'
+    )
+    return _parse_salloc_job_id(_ssh_stdout(config, remote))
+
+
+def ensure_held_salloc(config: OrcdConfig, local_project: Path) -> OrcdConfig:
+    """Keep one H200 allocation and reuse it. Do not sbatch-and-release."""
+    config = _orcd_with_disk_salloc(config, local_project)
+    if config.salloc_job_id and slurm_job_state(config, config.salloc_job_id) in _HOLD_STATES:
+        return config
+    job_id = _submit_held_salloc(config)
+    persist_salloc_job_id(local_project, job_id)
+    return config.model_copy(update={"salloc_job_id": job_id})
+
+
+def wait_until_salloc_running(config: OrcdConfig, *, poll_seconds: int = 30) -> None:
+    job_id = config.salloc_job_id
+    if not job_id:
+        raise RuntimeError("no salloc job id to wait for")
+    while True:
+        state = slurm_job_state(config, job_id)
+        if state == "RUNNING":
+            return
+        if state in {"PENDING", "CONFIGURING", "REQUEUED"}:
+            time.sleep(poll_seconds)
+            continue
+        raise RuntimeError(f"held salloc {job_id} ended in {state or 'missing'}")
+
+
 def wait_for_slurm_job(config: OrcdConfig, job_id: str, *, poll_seconds: int = 30) -> str:
     """Poll with short SSH commands so the mux is not held open like salloc."""
     last_state = ""
@@ -603,18 +705,58 @@ def ssh_handoff_commands(
     ]
 
 
+def _orcd_with_disk_salloc(config: OrcdConfig, local_project: Path) -> OrcdConfig:
+    """Pick up salloc_job_id written after a trial started."""
+    path = local_project / "config" / "orcd.yaml"
+    if not path.is_file():
+        return config
+    try:
+        from .config import load_orcd
+
+        job_id = load_orcd(path).salloc_job_id.strip()
+    except Exception:
+        return config
+    if job_id and job_id != config.salloc_job_id:
+        return config.model_copy(update={"salloc_job_id": job_id})
+    return config
+
+
 def evaluate_candidate_remote(
     config: OrcdConfig,
     bundle: Path,
     local_project: Path,
 ) -> Path:
+    lock_path = local_project / ".kernel-agent-bench" / "h200.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _evaluate_candidate_on_held_gpu(config, bundle, local_project)
+
+
+def _evaluate_candidate_on_held_gpu(
+    config: OrcdConfig,
+    bundle: Path,
+    local_project: Path,
+) -> Path:
+    probe_ssh(config)
+    config = ensure_held_salloc(config, local_project)
+    wait_until_salloc_running(config)
     manifest = CandidateManifest.model_validate_json(
         (bundle / "manifest.json").read_text(encoding="utf-8")
     )
     transfer = remote_transfer(config, bundle, local_project)
     transfer.local_result.parent.mkdir(parents=True, exist_ok=True)
-    probe_ssh(config)
     _run(ssh_base(config, batch=True) + [remote_mkdir_command(transfer)])
+    try:
+        _run(
+            ssh_base(config, batch=True)
+            + [remote_commit_command(transfer, manifest.baseline_commit)]
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"ORCD clone {transfer.remote_project} lacks baseline commit "
+            f"{manifest.baseline_commit}; push it to origin first"
+        ) from exc
 
     script = render_slurm(
         config,
@@ -641,17 +783,9 @@ def evaluate_candidate_remote(
     )
     eval_error: Exception | None = None
     try:
-        if config.salloc_job_id:
-            _run(ssh_base(config, batch=True) + [evaluate])
-        else:
-            submitted = _ssh_stdout(config, evaluate)
-            job_id = _parse_sbatch_job_id(submitted)
-            state = wait_for_slurm_job(config, job_id)
-            if state not in {"COMPLETED", "FAILED"}:
-                eval_error = RuntimeError(f"Slurm job {job_id} ended in {state}")
+        _run(ssh_base(config, batch=True) + [evaluate])
     except RuntimeError as exc:
         # Evaluators exit 2 when the candidate is incorrect but still write JSON.
-        # sbatch FAILED is the same case; still try to download the result.
         eval_error = exc
     try:
         _run(rsync_download_command(config, transfer))

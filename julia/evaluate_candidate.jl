@@ -57,7 +57,12 @@ function host_fields(fields)
     return Array(fields[1]), Array(fields[2])
 end
 
+boundary_fixed(actual, initial) =
+    actual[[1, end], :] == initial[[1, end], :] && actual[:, [1, end]] == initial[:, [1, end]]
+
+# Fresh copies so a candidate that aliases its inputs cannot mutate the shared initial fields.
 function make_states(initial_u, initial_v, backend, ka_device)
+    initial_u, initial_v = copy(initial_u), copy(initial_v)
     if backend == "ka"
         return (
             prepare_baseline(initial_u, initial_v; backend=ka_device),
@@ -83,29 +88,42 @@ else
     include(joinpath(@__DIR__, "timing_gpu.jl"))
 end
 
-function candidate_correctness(backend, ka_device, dtype, shapes, p, atol, rtol)
+function parse_dtype(name)
+    name == "Float32" && return Float32
+    name == "Float64" && return Float64
+    error("dtype must be Float32 or Float64, got $(name)")
+end
+
+function candidate_correctness(backend, ka_device, tolerances, shapes)
     cases = []
-    for shape in shapes
-        initial_u, initial_v = initialize_fields(dtype, shape)
-        for steps in (1, 5)
-            expected_u, expected_v = cpu_simulate(initial_u, initial_v, p, steps)
-            _, candidate_state = make_states(initial_u, initial_v, backend, ka_device)
-            run_candidate!(candidate_state, p, steps)
-            synchronize_run(backend, candidate_state)
-            actual_u, actual_v = host_fields(candidate_fields(candidate_state))
-            max_abs, relative = errors(actual_u, actual_v, expected_u, expected_v)
-            correct = isapprox(actual_u, expected_u; atol=atol, rtol=rtol) &&
-                      isapprox(actual_v, expected_v; atol=atol, rtol=rtol) &&
-                      all(isfinite, actual_u) && all(isfinite, actual_v) &&
-                      actual_u[[1, end], :] == initial_u[[1, end], :] &&
-                      actual_v[:, [1, end]] == initial_v[:, [1, end]]
-            push!(cases, Dict(
-                "shape" => collect(shape),
-                "steps" => steps,
-                "correct" => correct,
-                "max_abs_error" => max_abs,
-                "relative_l2_error" => relative,
-            ))
+    for (dtype, (atol, rtol)) in tolerances
+        p = GrayScottParams(dtype)
+        for shape in shapes
+            initial_u, initial_v = initialize_fields(dtype, shape)
+            for steps in (1, 5)
+                expected_u, expected_v = cpu_simulate(initial_u, initial_v, p, steps)
+                _, candidate_state = make_states(initial_u, initial_v, backend, ka_device)
+                run_candidate!(candidate_state, p, steps)
+                synchronize_run(backend, candidate_state)
+                actual_u, actual_v = host_fields(candidate_fields(candidate_state))
+                max_abs, relative = errors(actual_u, actual_v, expected_u, expected_v)
+                correct = eltype(actual_u) == dtype && eltype(actual_v) == dtype &&
+                          isapprox(actual_u, expected_u; atol=atol, rtol=rtol) &&
+                          isapprox(actual_v, expected_v; atol=atol, rtol=rtol) &&
+                          all(isfinite, actual_u) && all(isfinite, actual_v) &&
+                          boundary_fixed(actual_u, initial_u) &&
+                          boundary_fixed(actual_v, initial_v)
+                push!(cases, Dict(
+                    "dtype" => string(dtype),
+                    "shape" => collect(shape),
+                    "steps" => steps,
+                    "correct" => correct,
+                    "atol" => atol,
+                    "rtol" => rtol,
+                    "max_abs_error" => max_abs,
+                    "relative_l2_error" => relative,
+                ))
+            end
         end
     end
     return all(case["correct"] for case in cases), cases
@@ -204,13 +222,20 @@ function main()
     repetitions = parse(Int, get(options, "repetitions", "5"))
     atol = parse(Float64, get(options, "atol", "2e-5"))
     rtol = parse(Float64, get(options, "rtol", "2e-4"))
-    dtype_name = get(options, "dtype", "Float32")
-    dtype = dtype_name == "Float32" ? Float32 :
-            dtype_name == "Float64" ? Float64 :
-            error("dtype must be Float32 or Float64")
+    dtype = parse_dtype(get(options, "dtype", "Float32"))
     p = GrayScottParams(dtype)
+    atol64 = parse(Float64, get(options, "atol64", "1e-12"))
+    rtol64 = parse(Float64, get(options, "rtol64", "1e-10"))
+    correctness_dtypes = [
+        parse_dtype(strip(name))
+        for name in split(get(options, "correctness-dtypes", "Float32,Float64"), ',')
+        if !isempty(strip(name))
+    ]
+    correctness_tolerances = [
+        T => (T == Float64 ? (atol64, rtol64) : (atol, rtol)) for T in correctness_dtypes
+    ]
     started = time()
-    evaluator_version = "gray-scott-julia-$(backend)-v1"
+    evaluator_version = "gray-scott-julia-$(backend)-v2"
 
     result = try
         if backend == "ka"
@@ -231,7 +256,7 @@ function main()
         compile_seconds = time() - compile_started
 
         correct, correctness_cases =
-            candidate_correctness(backend, ka_device, dtype, correctness_shapes, p, atol, rtol)
+            candidate_correctness(backend, ka_device, correctness_tolerances, correctness_shapes)
         workloads = correct ? [
             benchmark_workload(
                 backend, ka_device, dtype, shape, p, steps, warmups, repetitions, atol, rtol,

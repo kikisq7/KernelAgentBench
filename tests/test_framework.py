@@ -11,7 +11,10 @@ from kernel_agent_bench.config import canonical_hash
 from kernel_agent_bench.graph import TrialGraph, geometric_mean
 from kernel_agent_bench.models import AgentRun, resolve_model_ids
 from kernel_agent_bench.orcd import (
+    _parse_salloc_job_id,
     _parse_sbatch_job_id,
+    persist_salloc_job_id,
+    remote_commit_command,
     remote_eval_command,
     remote_mkdir_command,
     remote_transfer,
@@ -36,6 +39,8 @@ from kernel_agent_bench.schemas import (
     WorkloadResult,
 )
 from kernel_agent_bench.tracing import configure_tracing, trace_payload
+
+JULIA_CORRECTNESS_CASES = [{"dtype": "Float32"}, {"dtype": "Float64"}]
 
 
 def test_model_resolution_uses_newest_natural_version() -> None:
@@ -95,6 +100,17 @@ def test_orcd_required_fields_and_salloc_flags() -> None:
         "h200:1",
         "-p",
     ]
+    assert salloc_command(config, wall_time="04:00:00")[10] == "04:00:00"
+
+
+def test_persist_and_parse_held_salloc(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "orcd.yaml").write_text('salloc_job_id: ""\n', encoding="utf-8")
+    persist_salloc_job_id(tmp_path, "24592061")
+    assert 'salloc_job_id: "24592061"' in (config_dir / "orcd.yaml").read_text(encoding="utf-8")
+    assert _parse_salloc_job_id("salloc: Pending job allocation 24592061\n") == "24592061"
+    assert _parse_salloc_job_id("salloc: Granted job allocation 99\n") == "99"
 
 
 @pytest.mark.parametrize(
@@ -256,6 +272,57 @@ def _git(path: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True)
 
 
+def test_trials_refuse_uncommitted_kernel_changes(tmp_path: Path) -> None:
+    kernel = tmp_path / "kernels" / "baseline.jl"
+    kernel.parent.mkdir()
+    kernel.write_text("old\n", encoding="utf-8")
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "baseline")
+    manager = CandidateManager(tmp_path)
+    manager.require_committed()
+    kernel.write_text("new\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="kernels/baseline.jl"):
+        manager.create_worktree("trial-1")
+
+
+def test_remote_commit_check_fetches_then_rechecks(tmp_path: Path) -> None:
+    project = tmp_path / "KernelAgentBench"
+    bundle = project / "candidates" / "candidate-1"
+    bundle.mkdir(parents=True)
+    manifest = CandidateManifest(
+        candidate_id="candidate-1",
+        trial_id="trial-1",
+        baseline_commit="abc1234",
+        patch_sha256="0" * 64,
+        patch_file="candidate.patch",
+        iteration=1,
+        language="julia-cuda",
+        task_version="test",
+        study_hash="1" * 64,
+        prompt_sha256="2" * 64,
+        evaluation=_study().evaluation,
+    )
+    (bundle / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+    config = OrcdConfig(
+        scratch_root="/scratch/user",
+        ssh_host="orcd-login.mit.edu",
+        ssh_user="user",
+        remote_project="/home/user/KernelAgentBench",
+    )
+    transfer = remote_transfer(config, bundle, project)
+    command = remote_commit_command(transfer, "abc1234")
+    assert command == (
+        "git -C /home/user/KernelAgentBench cat-file -e abc1234^{commit} 2>/dev/null || "
+        "{ git -C /home/user/KernelAgentBench fetch --quiet origin && "
+        "git -C /home/user/KernelAgentBench cat-file -e abc1234^{commit}; }"
+    )
+    with pytest.raises(ValueError):
+        remote_commit_command(transfer, "HEAD; rm -rf ~")
+
+
 def _study(
     language: str = "julia-ka",
     editable_path: str | None = None,
@@ -382,6 +449,7 @@ def test_mocked_checkpointed_trial(
             candidate_id=waiting["candidate_id"],
             language=language,
             evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
             status="passed",
             correct=True,
             workloads=[
@@ -451,6 +519,7 @@ def test_auto_salloc_evaluation_closes_the_loop(tmp_path: Path) -> None:
             candidate_id=manifest.candidate_id,
             language="julia-ka",
             evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
             status="passed",
             correct=True,
             workloads=[],
@@ -544,6 +613,7 @@ def test_stops_early_when_speedup_is_not_significant(tmp_path: Path) -> None:
             candidate_id=waiting["candidate_id"],
             language="julia-ka",
             evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
             status="passed",
             correct=True,
             workloads=[],
@@ -704,6 +774,7 @@ def test_cpu_backend_evaluates_locally(tmp_path: Path) -> None:
             language="julia-cpu",
             backend="cpu",
             evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
             status="passed",
             correct=True,
             workloads=[],

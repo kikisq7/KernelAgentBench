@@ -1,18 +1,19 @@
-study_id: gray-scott-julia-backends-v1
+study_id: gray-scott-julia-backends-v2
 task_version: gray-scott-2d-five-point-v1
 seed: 20260918
 replicates: 3
 trace_content: true
 
+# Exact pins: discovery fails loudly instead of falling back to another model.
 models:
-  - alias: composer
-    match: "^composer-[0-9]"
+  - alias: opus-5.5
+    match: "^claude-opus-5-5$"
     newest: true
-  - alias: gpt-5.6
-    match: "^gpt-5\\.6-sol$"
+  - alias: gpt-6-astra
+    match: "^gpt-6-astra$"
     newest: true
-  - alias: anthropic
-    match: "^claude-opus"
+  - alias: composer-2.5
+    match: "^composer-2\\.5$"
     newest: true
 
 # Julia-only study. Agents still run the existing optimize → test → eval loop.
@@ -77,6 +78,9 @@ languages:
       rtol: 0.0002
       max_regression_fraction: 0.03
       min_relative_improvement: 0.05
+      correctness_dtypes: [Float32, Float64]
+      float64_atol: 1.0e-12
+      float64_rtol: 1.0e-10
 
 budgets:
   max_agent_iterations: 5
@@ -101,3 +105,8 @@ evaluation:
   rtol: 0.0002
   max_regression_fraction: 0.03
   min_relative_improvement: 0.05
+  # Correctness gate runs in both precisions; timing stays on `dtype`.
+  # atol/rtol above apply to Float32.
+  correctness_dtypes: [Float32, Float64]
+  float64_atol: 1.0e-12
+  float64_rtol: 1.0e-10

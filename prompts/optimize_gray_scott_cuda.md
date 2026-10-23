@@ -29,5 +29,8 @@ trusted CUDA.jl baseline, so the first GPU evaluation should be about 1.0x.
 Primary objective: maximize steady-state timesteps per second over every
 required workload. Correctness is a hard gate. You have at most five GPU
 evaluations; the trial stops early if speedup does not improve by at least 5%.
+Correctness is checked in both Float32 and Float64, so keep the code generic
+over the element type (no hard-coded Float32 literals, arrays, or conversions);
+timing uses Float32.
 Run the public test command before returning and summarize the optimization
 and expected bottleneck.
