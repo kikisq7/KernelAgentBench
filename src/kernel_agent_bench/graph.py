@@ -70,6 +70,12 @@ class TrialState(TypedDict, total=False):
     last_feedback: str
     orcd: dict[str, Any] | None
     auto_evaluate: bool
+    started_at: float
+    agent_seconds: float
+    public_check_seconds: float
+    evaluation_seconds: float
+    evaluation_wall_seconds: float | None
+    charged_cents: float
 
 
 def _sum_tokens(current: dict[str, Any], new: TokenRecord) -> TokenRecord:
@@ -210,6 +216,24 @@ class TrialGraph:
             "graph_hash": state["graph_hash"],
         }
 
+    def _record(self, name: str, state: TrialState, event: str, **fields: Any) -> None:
+        """Local JSONL is the source of truth; LangSmith traces are best-effort."""
+        append_jsonl(
+            self.project / "results" / f"{name}.jsonl",
+            {
+                "event": event,
+                "recorded_at": time.time(),
+                "study_id": state["study"]["study_id"],
+                "trial_id": state["trial_id"],
+                "model_alias": state["model_alias"],
+                "resolved_model_id": state["resolved_model_id"],
+                "language": state["language"],
+                "replicate": state["replicate"],
+                "iteration": state["iteration"],
+                **fields,
+            },
+        )
+
     @staticmethod
     def _target(study: StudyConfig, language: str) -> LanguageTarget:
         for target in study.languages:
@@ -247,12 +271,39 @@ class TrialGraph:
                 include_content=study.trace_content,
                 run_type="llm",
             ) as span:
-                run = self.model_runner(
-                    state["resolved_model_id"],
-                    agent_workspace,
-                    prompt,
-                )
+                agent_started = time.time()
+                try:
+                    run = self.model_runner(
+                        state["resolved_model_id"],
+                        agent_workspace,
+                        prompt,
+                    )
+                except Exception as exception:
+                    self._record(
+                        "agent_runs",
+                        state,
+                        "agent_run_error",
+                        started_at=agent_started,
+                        wall_seconds=time.time() - agent_started,
+                        error=repr(exception)[-4000:],
+                    )
+                    raise
+                agent_seconds = time.time() - agent_started
                 cumulative = _sum_tokens(state.get("token_usage", {}), run.usage)
+                charged = (run.cost or {}).get("charged_cents") or 0
+                self._record(
+                    "agent_runs",
+                    state,
+                    "agent_run",
+                    agent_id=run.agent_id,
+                    cursor_run_id=run.run_id,
+                    status=run.status,
+                    started_at=agent_started,
+                    wall_seconds=agent_seconds,
+                    token_usage=run.usage.model_dump(),
+                    cumulative_token_usage=cumulative.model_dump(),
+                    billed_cost=run.cost,
+                )
                 outputs = {
                     "status": run.status,
                     "response": run.response,
@@ -295,6 +346,8 @@ class TrialGraph:
             "token_usage": cumulative.model_dump(),
             "total_tokens": cumulative.total_tokens,
             "agent_workspace": str(agent_workspace),
+            "agent_seconds": state.get("agent_seconds", 0.0) + agent_seconds,
+            "charged_cents": state.get("charged_cents", 0.0) + charged,
         }
 
     def _public_checks(self, state: TrialState) -> dict[str, Any]:
@@ -313,6 +366,7 @@ class TrialGraph:
             include_content=study.trace_content,
             run_type="tool",
         ) as span:
+            check_started = time.time()
             completed = subprocess.run(
                 command,
                 cwd=state["workspace"],
@@ -320,6 +374,7 @@ class TrialGraph:
                 capture_output=True,
                 timeout=min(study.budgets.max_wall_seconds, 1800),
             )
+            check_seconds = time.time() - check_started
             result = {
                 "command": command,
                 "exit_code": completed.returncode or (2 if validation_error else 0),
@@ -327,6 +382,16 @@ class TrialGraph:
                 "stderr": (completed.stderr + "\n" + validation_error).strip()[-50_000:],
             }
             add_trace_outputs(span, result, study.trace_content)
+        self._record(
+            "agent_runs",
+            state,
+            "public_check",
+            passed=not result["exit_code"],
+            exit_code=result["exit_code"],
+            wall_seconds=check_seconds,
+            stderr_tail=str(result["stderr"])[-2000:],
+        )
+        public_check_seconds = state.get("public_check_seconds", 0.0) + check_seconds
         if result["exit_code"]:
             next_iteration = state["iteration"] + 1
             reason = self._budget_reason(state, next_iteration, study)
@@ -336,8 +401,14 @@ class TrialGraph:
                 "iteration": next_iteration,
                 "last_feedback": str(result["stderr"])[-4000:],
                 "termination_reason": reason,
+                "public_check_seconds": public_check_seconds,
             }
-        return {"status": "packaging", "public_test": result, "last_feedback": ""}
+        return {
+            "status": "packaging",
+            "public_test": result,
+            "last_feedback": "",
+            "public_check_seconds": public_check_seconds,
+        }
 
     def _worktree(self, state: TrialState) -> Worktree:
         return Worktree(
@@ -398,6 +469,28 @@ class TrialGraph:
         }
 
     def _evaluate_h200(self, state: TrialState) -> dict[str, Any]:
+        started = time.time()
+        try:
+            result_path = self._run_evaluation(state)
+        except Exception as exception:
+            self._record(
+                "evaluation_events",
+                state,
+                "evaluation_error",
+                candidate_id=state["candidate_id"],
+                wall_seconds=time.time() - started,
+                error=repr(exception)[-4000:],
+            )
+            raise
+        wall_seconds = time.time() - started
+        return {
+            "status": "awaiting_h200_result",
+            "evaluation_result_path": str(result_path),
+            "evaluation_wall_seconds": wall_seconds,
+            "evaluation_seconds": state.get("evaluation_seconds", 0.0) + wall_seconds,
+        }
+
+    def _run_evaluation(self, state: TrialState) -> Path:
         study = StudyConfig.model_validate(state["study"])
         target = self._target(study, state["language"])
         if target.evaluate_locally:
@@ -418,10 +511,7 @@ class TrialGraph:
                     {"result_path": str(result_path)},
                     study.trace_content,
                 )
-            return {
-                "status": "awaiting_h200_result",
-                "evaluation_result_path": str(result_path),
-            }
+            return result_path
         if not state.get("orcd"):
             raise ValueError("auto GPU evaluation requires an ORCD config")
         orcd = OrcdConfig.model_validate(state["orcd"])
@@ -456,10 +546,7 @@ class TrialGraph:
                 {"result_path": str(result_path)},
                 study.trace_content,
             )
-        return {
-            "status": "awaiting_h200_result",
-            "evaluation_result_path": str(result_path),
-        }
+        return result_path
 
     def _ingest_result(self, state: TrialState) -> dict[str, Any]:
         study = StudyConfig.model_validate(state["study"])
@@ -503,15 +590,22 @@ class TrialGraph:
                 },
                 study.trace_content,
             )
-        append_jsonl(
-            self.project / "results" / "evaluation_events.jsonl",
-            {"event": "evaluation_ingested", "evaluation": evaluation},
+        self._record(
+            "evaluation_events",
+            state,
+            "evaluation_ingested",
+            candidate_id=result.candidate_id,
+            correct=result.correct,
+            geometric_mean_speedup=result.geometric_mean_speedup,
+            wall_seconds=state.get("evaluation_wall_seconds"),
+            evaluation=evaluation,
         )
         return {
             "status": "selecting",
             "evaluation": evaluation,
             "h200_evaluations": state["h200_evaluations"] + 1,
             "evaluation_result_path": "",
+            "evaluation_wall_seconds": None,
         }
 
     def _select_candidate(self, state: TrialState) -> dict[str, Any]:
@@ -598,7 +692,20 @@ class TrialGraph:
             incumbent_candidate_id=state.get("incumbent_candidate_id"),
             incumbent_speedup=state.get("incumbent_speedup"),
             termination_reason=state.get("termination_reason") or "already_finished",
-            metadata={"study_hash": state["study_hash"], "graph_hash": state["graph_hash"]},
+            metadata={
+                "study_hash": state["study_hash"],
+                "graph_hash": state["graph_hash"],
+                "baseline_commit": state["baseline_commit"],
+                "started_at": state.get("started_at"),
+                "finished_at": time.time(),
+                "wall_seconds": (
+                    time.time() - state["started_at"] if state.get("started_at") else None
+                ),
+                "agent_seconds": state.get("agent_seconds", 0.0),
+                "public_check_seconds": state.get("public_check_seconds", 0.0),
+                "evaluation_seconds": state.get("evaluation_seconds", 0.0),
+                "charged_cents": state.get("charged_cents", 0.0),
+            },
         )
         append_jsonl(self.project / "results" / "trials.jsonl", record)
         if state.get("agent_workspace"):
@@ -636,6 +743,12 @@ class TrialGraph:
             "replicate": replicate,
             "seed": study.seed + replicate,
             "started_monotonic": time.monotonic(),
+            "started_at": time.time(),
+            "agent_seconds": 0.0,
+            "public_check_seconds": 0.0,
+            "evaluation_seconds": 0.0,
+            "evaluation_wall_seconds": None,
+            "charged_cents": 0.0,
             "baseline_commit": worktree.baseline_commit,
             "worktree_root": str(worktree.root),
             "workspace": str(worktree.project),

@@ -26,6 +26,7 @@ from kernel_agent_bench.orcd import (
     ssh_control_path,
     ssh_handoff_commands,
 )
+from kernel_agent_bench.records import read_jsonl
 from kernel_agent_bench.schemas import (
     Budgets,
     CandidateManifest,
@@ -805,6 +806,19 @@ def test_cpu_backend_evaluates_locally(tmp_path: Path) -> None:
         assert finished["incumbent_speedup"] == 1.1
     finally:
         graph.close()
+
+    results = project / "results"
+    runs = read_jsonl([results / "agent_runs.jsonl"])
+    assert [row["event"] for row in runs] == ["agent_run", "public_check"]
+    assert runs[0]["trial_id"] == "trial-cpu"
+    assert runs[0]["token_usage"]["total_tokens"] == 5
+    assert runs[0]["wall_seconds"] >= 0
+    (evaluation,) = read_jsonl([results / "evaluation_events.jsonl"])
+    assert evaluation["geometric_mean_speedup"] == 1.1
+    assert evaluation["wall_seconds"] >= 0
+    (trial,) = read_jsonl([results / "trials.jsonl"])
+    assert trial["token_usage"]["total_tokens"] == 5
+    assert trial["metadata"]["wall_seconds"] >= trial["metadata"]["evaluation_seconds"] >= 0
 
 
 def test_study_example_is_julia_backends() -> None:
