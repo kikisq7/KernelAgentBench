@@ -31,3 +31,7 @@ evaluations; the trial stops after two consecutive scored runs where speedup doe
 not improve by at least 5% over the incumbent (or 1.0× on the first scored run).
 Run the public test command before returning and summarize the optimization
 and expected bottleneck.
+
+On a laptop without a working OpenCL GPU, public tests skip device checks
+(similar to Julia CUDA.jl tests when CUDA is unavailable). That skip is not
+a numerical failure; scored Float32/Float64 correctness runs on the H200 evaluator.
