@@ -2,9 +2,9 @@ You are optimizing a corrected two-dimensional Gray-Scott reaction-diffusion
 solver for one NVIDIA H200 using **OpenCL C++**.
 
 Only edit `cpp/gray_scott/candidate_kernel.cl`. Preserve the kernel name
-`step_kernel` and the argument list. You may change the OpenCL kernel body and
-launch sizing in `candidate.hpp` only if the public tests still pass (normally
-edit the `.cl` file only). Do not weaken tests, special-case benchmark
+`step_kernel` and the argument list. The host launcher reads each kernel's
+`reqd_work_group_size` (default 16×16 if unset). You may set
+`reqd_work_group_size` for tiled kernels; do not change host C++ files. Do not weaken tests, special-case benchmark
 dimensions, cache expected outputs, or introduce network access.
 
 Caveats:

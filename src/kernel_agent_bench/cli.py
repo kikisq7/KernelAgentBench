@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from .config import canonical_hash, load_orcd, load_study, project_root
+from .config import canonical_hash, load_orcd, load_project_env, load_study, project_root
 from .graph import TrialGraph
 from .models import discover_models
 from .orcd import (
@@ -21,6 +22,11 @@ from .schemas import StudyConfig, json_schema_bundle
 from .tracing import configure_tracing
 
 app = typer.Typer(no_args_is_help=True, help="Julia kernel coding-agent benchmark.")
+
+
+@app.callback()
+def _load_env() -> None:
+    load_project_env()
 
 
 def _study(path: Path | None) -> tuple[Path, StudyConfig]:
@@ -66,14 +72,21 @@ def start(
 ) -> None:
     configure_tracing()
     _, study = _study(study_path)
-    orcd = load_orcd(orcd_path) if orcd_path else None
-    if orcd and orcd.auto_evaluate:
-        probe_ssh(orcd)
     selectors = [model for model in study.models if model.alias == model_alias]
     if not selectors:
         aliases = ", ".join(model.alias for model in study.models)
         raise typer.BadParameter(f"unknown model alias; choose from {aliases}")
+    if selectors[0].provider == "anthropic":
+        if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            raise typer.BadParameter(
+                "ANTHROPIC_API_KEY is missing from KernelAgentBench/.env. "
+                "Claude trials call the Anthropic API and do not use CURSOR_API_KEY."
+            )
+        os.environ["KAB_ANTHROPIC_EFFORT"] = selectors[0].effort
     resolved = discover_models(selectors)
+    orcd = load_orcd(orcd_path) if orcd_path else None
+    if orcd and orcd.auto_evaluate:
+        probe_ssh(orcd)
     language_ids = {target.id for target in study.languages}
     if language not in language_ids:
         raise typer.BadParameter(f"unknown language; choose from {', '.join(sorted(language_ids))}")
@@ -144,7 +157,11 @@ def pending() -> None:
     evaluation_log = project_root() / "results" / "evaluation_events.jsonl"
     if evaluation_log.exists():
         for row in read_jsonl([evaluation_log]):
-            evaluated.add(row["evaluation"]["candidate_id"])
+            evaluation = row.get("evaluation")
+            if isinstance(evaluation, dict) and evaluation.get("candidate_id"):
+                evaluated.add(evaluation["candidate_id"])
+            elif row.get("event") == "evaluation_ingested" and row.get("candidate_id"):
+                evaluated.add(row["candidate_id"])
     for manifest_path in sorted((project_root() / "candidates").glob("*/manifest.json")):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest["candidate_id"] not in evaluated:
@@ -214,6 +231,8 @@ def summary(
             "speedup": row.get("incumbent_speedup"),
             "h200_evaluations": row["h200_evaluations"],
             "total_tokens": row["token_usage"]["total_tokens"],
+            "first_correct_iteration": row.get("first_correct_iteration"),
+            "tokens_to_correctness": row.get("tokens_to_correctness"),
             "termination_reason": row.get("termination_reason"),
         }
         for row in rows

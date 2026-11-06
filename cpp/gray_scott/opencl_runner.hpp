@@ -16,6 +16,30 @@ struct OpenCLKernelRunner {
     cl_program program = nullptr;
     cl_kernel kernel_f32 = nullptr;
     cl_kernel kernel_f64 = nullptr;
+    std::size_t local_x = 16;
+    std::size_t local_y = 16;
+    std::size_t local_x_f64 = 16;
+    std::size_t local_y_f64 = 16;
+
+    static std::pair<std::size_t, std::size_t> query_local_work_size(cl_kernel kernel) {
+        std::size_t compiled[3] = {0, 0, 0};
+        OpenCLRuntime& runtime = OpenCLRuntime::instance();
+        cl_check(
+            clGetKernelWorkGroupInfo(
+                kernel,
+                runtime.device,
+                CL_KERNEL_COMPILE_WORK_GROUP_SIZE,
+                sizeof(compiled),
+                compiled,
+                nullptr
+            ),
+            "clGetKernelWorkGroupInfo CL_KERNEL_COMPILE_WORK_GROUP_SIZE"
+        );
+        if (compiled[0] > 0 && compiled[1] > 0) {
+            return {compiled[0], compiled[1]};
+        }
+        return {16, 16};
+    }
 
     explicit OpenCLKernelRunner(const std::filesystem::path& kernel_path) {
         const std::string source = read_text_file(kernel_path.string());
@@ -23,9 +47,12 @@ struct OpenCLKernelRunner {
         cl_int error = 0;
         kernel_f32 = clCreateKernel(program, "step_kernel", &error);
         cl_check(error, "clCreateKernel step_kernel");
+        std::tie(local_x, local_y) = query_local_work_size(kernel_f32);
         kernel_f64 = clCreateKernel(program, "step_kernel_f64", &error);
         if (error != CL_SUCCESS) {
             kernel_f64 = nullptr;
+        } else {
+            std::tie(local_x_f64, local_y_f64) = query_local_work_size(kernel_f64);
         }
     }
 
@@ -42,8 +69,6 @@ struct OpenCLKernelRunner {
 
     void enqueue_f32(DeviceFields& state, GrayScottParams params, cl_event* event) {
         OpenCLRuntime& runtime = OpenCLRuntime::instance();
-        const std::size_t local_x = 16;
-        const std::size_t local_y = 16;
         const std::size_t global_x =
             ((static_cast<std::size_t>(state.width) + local_x - 1) / local_x) * local_x;
         const std::size_t global_y =
@@ -76,14 +101,14 @@ struct OpenCLKernelRunner {
 
     void enqueue_f64(DeviceFieldsF64& state, GrayScottParams params, cl_event* event) {
         OpenCLRuntime& runtime = OpenCLRuntime::instance();
-        const std::size_t local_x = 16;
-        const std::size_t local_y = 16;
         const std::size_t global_x =
-            ((static_cast<std::size_t>(state.width) + local_x - 1) / local_x) * local_x;
+            ((static_cast<std::size_t>(state.width) + local_x_f64 - 1) / local_x_f64) *
+            local_x_f64;
         const std::size_t global_y =
-            ((static_cast<std::size_t>(state.height) + local_y - 1) / local_y) * local_y;
+            ((static_cast<std::size_t>(state.height) + local_y_f64 - 1) / local_y_f64) *
+            local_y_f64;
         const std::size_t global[2] = {global_x, global_y};
-        const std::size_t local[2] = {local_x, local_y};
+        const std::size_t local[2] = {local_x_f64, local_y_f64};
         const double diffusion_u = params.diffusion_u;
         const double diffusion_v = params.diffusion_v;
         const double feed = params.feed;

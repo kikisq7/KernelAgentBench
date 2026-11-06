@@ -441,6 +441,8 @@ def render_slurm(
             + f"julia --project={shlex.quote(julia_project)} "
             + "-e 'using Pkg; Pkg.instantiate()'"
         )
+    elif manifest.language == "cpp":
+        setup = setup + ("\n" if setup else "") + "module load gcc"
     evaluator_args = manifest_evaluator_args(manifest, _normalize_abs(result))
     if is_julia_language(manifest.language):
         executable = [
@@ -463,7 +465,10 @@ def render_slurm(
         command = (
             f'mkdir -p "$(dirname {binary})"\n'
             "COMPILE_STARTED=$(date +%s%N)\n"
-            f"g++ -O3 -std=c++17 -I{relative_project}/cpp {source} -o {binary} -lOpenCL\n"
+            f'g++ -O3 -std=c++17 -I{relative_project}/cpp '
+            f'-I"${{CUDA_HOME:-/usr/local/cuda}}/include" '
+            f"{source} -o {binary} "
+            f'-L"${{CUDA_HOME:-/usr/local/cuda}}/lib64" -lOpenCL\n'
             "COMPILE_ENDED=$(date +%s%N)\n"
             "COMPILE_SECONDS=$(python3 -c "
             "'import sys; print((int(sys.argv[2])-int(sys.argv[1]))/1e9)' "
