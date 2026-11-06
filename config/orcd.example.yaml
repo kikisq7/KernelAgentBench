@@ -28,13 +28,14 @@ ssh_port: 22
 identity_file: ""
 remote_project: "REQUIRED"
 auto_evaluate: true
-# If you already hold an salloc, set the job id and each eval uses srun only.
+# Empty: one sbatch job per eval (recommended). Set to a live salloc job id to srun on a hold.
 salloc_job_id: ""
 
 setup_commands:
   - module purge
   - module load julia
   - module load cuda
+  # OpenCL C++ track: NVIDIA OpenCL comes with the CUDA module on ORCD.
   # - module load python
   # - source /path/to/UROPJulia/KernelAgentBench/.venv/bin/activate
 

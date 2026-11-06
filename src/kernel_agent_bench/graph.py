@@ -14,7 +14,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from .candidates import CandidateManager, Worktree
-from .models import AgentRun, run_cursor_agent
+from .models import AgentRun, run_coding_agent
 from .orcd import evaluate_candidate_local, evaluate_candidate_remote
 from .records import append_jsonl, sha256_file
 from .schemas import (
@@ -66,6 +66,9 @@ class TrialState(TypedDict, total=False):
     evaluation: dict[str, Any]
     incumbent_candidate_id: str | None
     incumbent_speedup: float | None
+    no_improvement_streak: int
+    first_correct_iteration: int | None
+    tokens_to_correctness: int | None
     termination_reason: str | None
     last_feedback: str
     orcd: dict[str, Any] | None
@@ -114,7 +117,7 @@ class TrialGraph:
         self,
         project: Path,
         *,
-        model_runner: ModelRunner = run_cursor_agent,
+        model_runner: ModelRunner = run_coding_agent,
         evaluate_runner: EvaluateRunner = evaluate_candidate_remote,
         local_evaluate_runner: LocalEvaluateRunner = evaluate_candidate_local,
         checkpoint_path: Path | None = None,
@@ -265,7 +268,7 @@ class TrialGraph:
         prompt = state["prompt"] + feedback
         try:
             with trace_span(
-                "cursor_coding_agent",
+                "coding_agent",
                 inputs={"prompt": prompt, "workspace": str(agent_workspace)},
                 metadata=self._metadata(state),
                 include_content=study.trace_content,
@@ -327,7 +330,7 @@ class TrialGraph:
                 add_trace_outputs(span, outputs, study.trace_content)
             if run.status not in {"finished", "success"}:
                 raise RuntimeError(
-                    f"Cursor run failed with status {run.status}: {run.response}"
+                    f"Agent run failed with status {run.status}: {run.response}"
                 )
             self.manager.sync_editable_from_agent(
                 worktree,
@@ -528,7 +531,7 @@ class TrialGraph:
                 "candidate_id": state["candidate_id"],
                 "eval": (
                     f"srun --jobid={orcd.salloc_job_id}"
-                    if orcd.salloc_job_id
+                    if orcd.salloc_job_id.strip()
                     else "sbatch --parsable"
                 ),
             },
@@ -568,7 +571,9 @@ class TrialGraph:
                 raise ValueError(
                     f"result language {result.language} does not match {state['language']}"
                 )
-            if result.status != "error" and is_julia_language(result.language):
+            if result.status != "error" and (
+                is_julia_language(result.language) or result.language == "cpp"
+            ):
                 target = self._target(study, state["language"])
                 expected = (target.evaluation or study.evaluation).correctness_dtypes
                 seen = {case.get("dtype") for case in result.correctness_cases}
@@ -590,6 +595,12 @@ class TrialGraph:
                 },
                 study.trace_content,
             )
+        first_correct: dict[str, Any] = {}
+        if result.correct and state.get("first_correct_iteration") is None:
+            first_correct = {
+                "first_correct_iteration": state["iteration"],
+                "tokens_to_correctness": int(state.get("total_tokens") or 0),
+            }
         self._record(
             "evaluation_events",
             state,
@@ -599,6 +610,7 @@ class TrialGraph:
             geometric_mean_speedup=result.geometric_mean_speedup,
             wall_seconds=state.get("evaluation_wall_seconds"),
             evaluation=evaluation,
+            **first_correct,
         )
         return {
             "status": "selecting",
@@ -606,6 +618,7 @@ class TrialGraph:
             "h200_evaluations": state["h200_evaluations"] + 1,
             "evaluation_result_path": "",
             "evaluation_wall_seconds": None,
+            **first_correct,
         }
 
     def _select_candidate(self, state: TrialState) -> dict[str, Any]:
@@ -614,6 +627,7 @@ class TrialGraph:
         evaluation = EvaluationResult.model_validate(state["evaluation"])
         incumbent_speedup = state.get("incumbent_speedup")
         incumbent_candidate = state.get("incumbent_candidate_id")
+        no_improvement_streak = int(state.get("no_improvement_streak") or 0)
         improved = False
         if evaluation.correct and evaluation.geometric_mean_speedup is not None:
             reference = incumbent_speedup if incumbent_speedup is not None else 1.0
@@ -627,6 +641,12 @@ class TrialGraph:
                 incumbent_speedup = evaluation.geometric_mean_speedup
                 incumbent_candidate = evaluation.candidate_id
             improved = evaluation.geometric_mean_speedup >= required
+            if improved:
+                no_improvement_streak = 0
+            else:
+                no_improvement_streak += 1
+        else:
+            no_improvement_streak = 0
 
         if incumbent_candidate != evaluation.candidate_id:
             self.manager.restore_candidate(
@@ -637,13 +657,20 @@ class TrialGraph:
 
         next_iteration = state["iteration"] + 1
         reason = self._budget_reason(state, next_iteration, study)
-        if reason is None and evaluation.correct and not improved:
+        stop_after = study.budgets.no_improvement_streak_to_stop
+        if (
+            reason is None
+            and evaluation.correct
+            and not improved
+            and no_improvement_streak >= stop_after
+        ):
             reason = "no_significant_improvement"
         selected = {
             "status": "finishing" if reason else "optimizing",
             "iteration": next_iteration,
             "incumbent_candidate_id": incumbent_candidate,
             "incumbent_speedup": incumbent_speedup,
+            "no_improvement_streak": no_improvement_streak,
             "termination_reason": reason,
         }
         with trace_span(
@@ -691,6 +718,8 @@ class TrialGraph:
             token_usage=token_usage,
             incumbent_candidate_id=state.get("incumbent_candidate_id"),
             incumbent_speedup=state.get("incumbent_speedup"),
+            first_correct_iteration=state.get("first_correct_iteration"),
+            tokens_to_correctness=state.get("tokens_to_correctness"),
             termination_reason=state.get("termination_reason") or "already_finished",
             metadata={
                 "study_hash": state["study_hash"],
@@ -761,6 +790,9 @@ class TrialGraph:
             "parent_candidate_id": None,
             "incumbent_candidate_id": None,
             "incumbent_speedup": None,
+            "no_improvement_streak": 0,
+            "first_correct_iteration": None,
+            "tokens_to_correctness": None,
             "termination_reason": None,
             "last_feedback": "",
             "orcd": orcd.model_dump(mode="json") if orcd else None,

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .schemas import CandidateManifest, EvaluationConfig, ensure_relative_paths
 
-TRIAL_INPUT_PATHS = ("kernels", "julia", "prompts")
+TRIAL_INPUT_PATHS = ("kernels", "julia", "cpp", "prompts")
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -54,6 +55,37 @@ def test_model_resolution_uses_newest_natural_version() -> None:
         "composer": "composer-2.12",
         "anthropic": "claude-4.6",
     }
+
+
+def test_anthropic_models_skip_the_cursor_catalog() -> None:
+    from kernel_agent_bench.models import anthropic_token_record, resolve_configured_models
+
+    opus = ModelSelector(
+        alias="opus-5.5",
+        match="^claude-opus-5-5$",
+        provider="anthropic",
+        model_id="claude-opus-5-5",
+        effort="high",
+    )
+    composer = ModelSelector(alias="composer-2.5", match=r"^composer-2\.5$")
+    resolved = resolve_configured_models([opus, composer], ["composer-2.5"])
+    assert resolved == {"opus-5.5": "claude-opus-5-5", "composer-2.5": "composer-2.5"}
+    with pytest.raises(ValueError, match="literal model_id"):
+        ModelSelector(alias="opus", match="^claude", provider="anthropic", effort="high")
+    record = anthropic_token_record(
+        None,
+        {
+            "claude-opus-5-5": {
+                "inputTokens": 10,
+                "outputTokens": 4,
+                "cacheReadInputTokens": 3,
+                "cacheCreationInputTokens": 2,
+                "thinkingTokens": 7,
+            }
+        },
+    )
+    assert record.total_tokens == 19
+    assert record.reasoning_tokens == 7
 
 
 def test_model_resolution_rejects_duplicates_and_missing() -> None:
@@ -121,7 +153,7 @@ def test_persist_and_parse_held_salloc(tmp_path: Path) -> None:
         ("julia-cpu", "--backend cpu"),
         ("julia-cuda", "--backend cuda"),
         ("python", "python/evaluate_candidate.py"),
-        ("cpp", "nvcc -O3"),
+        ("cpp", "g++ -O3 -std=c++17"),
     ],
 )
 def test_slurm_renderer_freezes_candidate_evaluation(
@@ -175,6 +207,8 @@ def test_slurm_renderer_freezes_candidate_evaluation(
     assert "--correctness-shapes 5x5" in script
     assert "--steps 1" in script
     assert expected_command in script
+    if language == "cpp":
+        assert "--correctness-dtypes Float32,Float64" in script
     remote_script = render_slurm(
         config,
         project=Path("/home/user/UROPJulia/KernelAgentBench"),
@@ -273,6 +307,22 @@ def _git(path: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True)
 
 
+def test_trials_refuse_uncommitted_cpp_changes(tmp_path: Path) -> None:
+    kernel = tmp_path / "cpp" / "gray_scott" / "candidate_kernel.cl"
+    kernel.parent.mkdir(parents=True)
+    kernel.write_text("__kernel void step_kernel(){}\n", encoding="utf-8")
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "baseline")
+    manager = CandidateManager(tmp_path)
+    manager.require_committed()
+    kernel.write_text("__kernel void step_kernel(){ /* edit */ }\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="cpp/gray_scott/candidate_kernel.cl"):
+        manager.create_worktree("trial-cpp")
+
+
 def test_trials_refuse_uncommitted_kernel_changes(tmp_path: Path) -> None:
     kernel = tmp_path / "kernels" / "baseline.jl"
     kernel.parent.mkdir()
@@ -337,7 +387,7 @@ def _study(
         "julia-ka": "ka",
         "julia": "cuda",
         "python": "cuda",
-        "cpp": "cuda",
+        "cpp": "opencl",
     }.get(language, "ka")
     default_editable = {
         "julia-cpu": "kernels/gray_scott/cpu/candidate.jl",
@@ -345,7 +395,7 @@ def _study(
         "julia-ka": "kernels/gray_scott/ka/candidate.jl",
         "julia": "kernels/gray_scott/cuda/candidate.jl",
         "python": "python/gray_scott/candidate.py",
-        "cpp": "cpp/gray_scott/candidate.cuh",
+        "cpp": "cpp/gray_scott/candidate_kernel.cl",
     }.get(language, "kernels/gray_scott/ka/candidate.jl")
     local = backend == "cpu" if evaluate_locally is None else evaluate_locally
     return StudyConfig(
@@ -371,6 +421,9 @@ def _study(
             rtol=1e-4,
             max_regression_fraction=0.03,
             min_relative_improvement=0.05,
+            correctness_dtypes=["Float32", "Float64"],
+            float64_atol=1e-12,
+            float64_rtol=1e-10,
         ),
         languages=[
             LanguageTarget(
@@ -392,7 +445,7 @@ def _study(
         ("julia-ka", "kernels/gray_scott/ka/candidate.jl"),
         ("julia-cuda", "kernels/gray_scott/cuda/candidate.jl"),
         ("python", "python/gray_scott/candidate.py"),
-        ("cpp", "cpp/gray_scott/candidate.cuh"),
+        ("cpp", "cpp/gray_scott/candidate_kernel.cl"),
     ],
 )
 def test_mocked_checkpointed_trial(
@@ -474,6 +527,8 @@ def test_mocked_checkpointed_trial(
         assert finished["status"] == "finished"
         assert finished["incumbent_speedup"] == 2.0
         assert finished["h200_evaluations"] == 1
+        assert finished["first_correct_iteration"] == 1
+        assert finished["tokens_to_correctness"] == 5
     finally:
         graph.close()
 
@@ -622,11 +677,31 @@ def test_stops_early_when_speedup_is_not_significant(tmp_path: Path) -> None:
         )
         result_path = tmp_path / "result.json"
         result_path.write_text(result.model_dump_json(), encoding="utf-8")
-        finished = graph.resume("trial-early-stop", result_path)
+        waiting = graph.resume("trial-early-stop", result_path)
+        assert waiting["status"] == "awaiting_h200_result"
+        assert waiting["h200_evaluations"] == 1
+        assert waiting.get("no_improvement_streak") == 1
+        assert waiting.get("termination_reason") is None
+
+        result2 = EvaluationResult(
+            candidate_id=waiting["candidate_id"],
+            language="julia-ka",
+            evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
+            status="passed",
+            correct=True,
+            workloads=[],
+            geometric_mean_speedup=1.02,
+        )
+        result_path2 = tmp_path / "result2.json"
+        result_path2.write_text(result2.model_dump_json(), encoding="utf-8")
+        finished = graph.resume("trial-early-stop", result_path2)
         assert finished["status"] == "finished"
-        assert finished["h200_evaluations"] == 1
+        assert finished["h200_evaluations"] == 2
         assert finished["termination_reason"] == "no_significant_improvement"
         assert finished["incumbent_speedup"] == 1.02
+        assert finished["first_correct_iteration"] == 1
+        assert finished["tokens_to_correctness"] == 5
     finally:
         graph.close()
 
@@ -818,7 +893,176 @@ def test_cpu_backend_evaluates_locally(tmp_path: Path) -> None:
     assert evaluation["wall_seconds"] >= 0
     (trial,) = read_jsonl([results / "trials.jsonl"])
     assert trial["token_usage"]["total_tokens"] == 5
+    assert trial["first_correct_iteration"] == 1
+    assert trial["tokens_to_correctness"] == 5
     assert trial["metadata"]["wall_seconds"] >= trial["metadata"]["evaluation_seconds"] >= 0
+
+
+def test_tokens_to_correctness_after_failed_h200_eval(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    project = repository / "KernelAgentBench"
+    candidate = project / "kernels" / "gray_scott" / "ka" / "candidate.jl"
+    prompt = project / "prompts" / "task.md"
+    candidate.parent.mkdir(parents=True)
+    prompt.parent.mkdir(parents=True)
+    candidate.write_text("baseline = true\n", encoding="utf-8")
+    prompt.write_text("optimize", encoding="utf-8")
+    (project / ".gitignore").write_text(
+        ".kernel-agent-bench/\ncandidates/\nresults/\n", encoding="utf-8"
+    )
+    _git(repository, "init")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "baseline")
+
+    def fake_runner(model_id: str, workspace: Path, agent_prompt: str) -> AgentRun:
+        del model_id, agent_prompt
+        (workspace / "kernels" / "gray_scott" / "ka" / "candidate.jl").write_text(
+            "baseline = false\n", encoding="utf-8"
+        )
+        return AgentRun(
+            status="finished",
+            agent_id="agent-test",
+            run_id="run-test",
+            response="changed candidate",
+            usage=TokenRecord(input_tokens=3, output_tokens=2, total_tokens=5),
+            cost=None,
+        )
+
+    study = _study()
+    study = study.model_copy(
+        update={
+            "budgets": Budgets(
+                max_agent_iterations=2,
+                max_h200_evaluations=2,
+                max_total_tokens=100000,
+                max_wall_seconds=3600,
+            )
+        }
+    )
+    graph = TrialGraph(project, model_runner=fake_runner)
+    try:
+        waiting = graph.start(
+            study=study,
+            study_hash=canonical_hash(study),
+            trial_id="trial-correctness-metrics",
+            model_alias="mock",
+            resolved_model_id="mock-1",
+            language="julia-ka",
+            replicate=1,
+        )
+        fail = EvaluationResult(
+            candidate_id=waiting["candidate_id"],
+            language="julia-ka",
+            evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
+            status="failed",
+            correct=False,
+            workloads=[],
+            geometric_mean_speedup=None,
+        )
+        fail_path = tmp_path / "fail.json"
+        fail_path.write_text(fail.model_dump_json(), encoding="utf-8")
+        waiting = graph.resume("trial-correctness-metrics", fail_path)
+        assert waiting["status"] == "awaiting_h200_result"
+        assert waiting.get("first_correct_iteration") is None
+        assert waiting.get("tokens_to_correctness") is None
+
+        pass_result = EvaluationResult(
+            candidate_id=waiting["candidate_id"],
+            language="julia-ka",
+            evaluator_version="test",
+            correctness_cases=JULIA_CORRECTNESS_CASES,
+            status="passed",
+            correct=True,
+            workloads=[
+                WorkloadResult(
+                    shape=(8, 8),
+                    baseline_samples_ms=[2.0],
+                    candidate_samples_ms=[1.0],
+                    baseline_median_ms=2.0,
+                    candidate_median_ms=1.0,
+                    speedup=2.0,
+                    correct=True,
+                    max_abs_error=0,
+                    relative_l2_error=0,
+                )
+            ],
+            geometric_mean_speedup=2.0,
+        )
+        pass_path = tmp_path / "pass.json"
+        pass_path.write_text(pass_result.model_dump_json(), encoding="utf-8")
+        finished = graph.resume("trial-correctness-metrics", pass_path)
+        assert finished["status"] == "finished"
+        assert finished["first_correct_iteration"] == 2
+        assert finished["tokens_to_correctness"] == 10
+    finally:
+        graph.close()
+
+    (trial,) = read_jsonl([project / "results" / "trials.jsonl"])
+    assert trial["first_correct_iteration"] == 2
+    assert trial["tokens_to_correctness"] == 10
+    evaluations = read_jsonl([project / "results" / "evaluation_events.jsonl"])
+    assert evaluations[0]["correct"] is False
+    assert "first_correct_iteration" not in evaluations[0]
+    assert evaluations[1]["first_correct_iteration"] == 2
+    assert evaluations[1]["tokens_to_correctness"] == 10
+
+
+def test_cpp_opencl_packages_candidate(tmp_path: Path) -> None:
+    bench_root = Path(__file__).resolve().parents[1]
+    repository = tmp_path / "repo"
+    project = repository / "KernelAgentBench"
+    cpp_tree = bench_root / "cpp"
+    for relative in (
+        "gray_scott/baseline_kernel.cl",
+        "gray_scott/candidate_kernel.cl",
+        "gray_scott/baseline.hpp",
+        "gray_scott/candidate.hpp",
+        "gray_scott/opencl_common.hpp",
+        "gray_scott/opencl_runner.hpp",
+        "evaluate_candidate.cpp",
+    ):
+        src = cpp_tree / relative
+        dest = project / "cpp" / relative
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    prompt = project / "prompts" / "optimize_gray_scott_cpp.md"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_text("optimize cpp", encoding="utf-8")
+    (project / ".gitignore").write_text(
+        ".kernel-agent-bench/\ncandidates/\nresults/\n", encoding="utf-8"
+    )
+    _git(repository, "init")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "baseline")
+
+    study = _study("cpp")
+    manager = CandidateManager(project)
+    worktree = manager.create_worktree("trial-cpp-pack")
+    kernel = worktree.project / "cpp/gray_scott/candidate_kernel.cl"
+    kernel.write_text(
+        kernel.read_text(encoding="utf-8") + "\n// agent tweak\n",
+        encoding="utf-8",
+    )
+    manifest, bundle = manager.package(
+        worktree,
+        "trial-cpp-pack",
+        1,
+        study.languages[0].editable_paths,
+        None,
+        "cpp",
+        study.task_version,
+        canonical_hash(study),
+        "optimize cpp",
+        study.evaluation,
+    )
+    assert manifest.language == "cpp"
+    assert "candidate_kernel.cl" in (bundle / "candidate.patch").read_text(encoding="utf-8")
+    manager.cleanup_worktree(worktree.root)
 
 
 def test_study_example_is_julia_backends() -> None:

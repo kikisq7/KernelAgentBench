@@ -367,6 +367,17 @@ def manifest_evaluator_args(manifest: CandidateManifest, output: Path) -> list[s
                 str(manifest.evaluation.float64_rtol),
             ]
         )
+    elif manifest.language == "cpp":
+        args.extend(
+            [
+                "--correctness-dtypes",
+                ",".join(manifest.evaluation.correctness_dtypes),
+                "--atol64",
+                str(manifest.evaluation.float64_atol),
+                "--rtol64",
+                str(manifest.evaluation.float64_rtol),
+            ]
+        )
     return args
 
 
@@ -443,16 +454,16 @@ def render_slurm(
         command = " ".join(shlex.quote(value) for value in executable + evaluator_args)
     elif manifest.language == "cpp":
         if manifest.evaluation.dtype != "Float32":
-            raise ValueError("the CUDA C++ evaluator currently supports Float32 only")
+            raise ValueError("the OpenCL C++ evaluator currently supports Float32 only")
         binary = f"{relative_project}/.build/evaluate_candidate_cpp"
-        source = f"{relative_project}/cpp/evaluate_candidate.cu"
+        source = f"{relative_project}/cpp/evaluate_candidate.cpp"
         run_args = evaluator_args.copy()
         dtype_index = run_args.index("--dtype")
         del run_args[dtype_index : dtype_index + 2]
         command = (
             f'mkdir -p "$(dirname {binary})"\n'
             "COMPILE_STARTED=$(date +%s%N)\n"
-            f"nvcc -O3 -std=c++17 -lineinfo {source} -o {binary}\n"
+            f"g++ -O3 -std=c++17 -I{relative_project}/cpp {source} -o {binary} -lOpenCL\n"
             "COMPILE_ENDED=$(date +%s%N)\n"
             "COMPILE_SECONDS=$(python3 -c "
             "'import sys; print((int(sys.argv[2])-int(sys.argv[1]))/1e9)' "
@@ -636,13 +647,19 @@ def _submit_held_salloc(config: OrcdConfig) -> str:
 
 
 def ensure_held_salloc(config: OrcdConfig, local_project: Path) -> OrcdConfig:
-    """Keep one H200 allocation and reuse it. Do not sbatch-and-release."""
+    """Reuse one held H200 allocation (srun). Requires salloc_job_id or creates a new hold."""
     config = _orcd_with_disk_salloc(config, local_project)
-    if config.salloc_job_id and slurm_job_state(config, config.salloc_job_id) in _HOLD_STATES:
+    if not config.salloc_job_id.strip():
+        raise RuntimeError("ensure_held_salloc requires salloc_job_id; leave it empty for sbatch")
+    if slurm_job_state(config, config.salloc_job_id) in _HOLD_STATES:
         return config
     job_id = _submit_held_salloc(config)
     persist_salloc_job_id(local_project, job_id)
     return config.model_copy(update={"salloc_job_id": job_id})
+
+
+def uses_held_salloc(config: OrcdConfig) -> bool:
+    return bool(config.salloc_job_id.strip())
 
 
 def wait_until_salloc_running(config: OrcdConfig, *, poll_seconds: int = 30) -> None:
@@ -730,17 +747,22 @@ def evaluate_candidate_remote(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        return _evaluate_candidate_on_held_gpu(config, bundle, local_project)
+        return _evaluate_candidate_remote_impl(config, bundle, local_project)
 
 
-def _evaluate_candidate_on_held_gpu(
+def _evaluate_candidate_remote_impl(
     config: OrcdConfig,
     bundle: Path,
     local_project: Path,
 ) -> Path:
     probe_ssh(config)
-    config = ensure_held_salloc(config, local_project)
-    wait_until_salloc_running(config)
+    config = _orcd_with_disk_salloc(config, local_project)
+    held = uses_held_salloc(config)
+    if held:
+        config = ensure_held_salloc(config, local_project)
+        wait_until_salloc_running(config)
+    else:
+        config = config.model_copy(update={"salloc_job_id": ""})
     manifest = CandidateManifest.model_validate_json(
         (bundle / "manifest.json").read_text(encoding="utf-8")
     )
@@ -782,11 +804,20 @@ def _evaluate_candidate_on_held_gpu(
         f"{remote_eval_command(config, str(transfer.remote_script))}"
     )
     eval_error: Exception | None = None
-    try:
-        _run(ssh_base(config, batch=True) + [evaluate])
-    except RuntimeError as exc:
-        # Evaluators exit 2 when the candidate is incorrect but still write JSON.
-        eval_error = exc
+    if held:
+        try:
+            _run(ssh_base(config, batch=True) + [evaluate])
+        except RuntimeError as exc:
+            # Evaluators exit 2 when the candidate is incorrect but still write JSON.
+            eval_error = exc
+    else:
+        try:
+            job_id = _parse_sbatch_job_id(_ssh_stdout(config, evaluate))
+            terminal = wait_for_slurm_job(config, job_id)
+            if terminal != "COMPLETED":
+                eval_error = RuntimeError(f"sbatch {job_id} ended in {terminal}")
+        except RuntimeError as exc:
+            eval_error = exc
     try:
         _run(rsync_download_command(config, transfer))
     except RuntimeError:

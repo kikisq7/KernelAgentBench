@@ -24,6 +24,27 @@ class ModelSelector(StrictModel):
     alias: str
     match: str
     newest: bool = True
+    # cursor: resolve `match` against Cursor.models.list() and run the Cursor agent.
+    # anthropic: call `model_id` with ANTHROPIC_API_KEY. Never send that trial to Cursor.
+    provider: Literal["cursor", "anthropic"] = "cursor"
+    model_id: str = ""
+    # Opus 5.5 thinking is always on. Effort is the only depth control; set it
+    # explicitly so a trial does not follow a later API default.
+    effort: Literal["", "low", "medium", "high", "xhigh", "max"] = ""
+
+    @model_validator(mode="after")
+    def anthropic_models_are_literal(self) -> ModelSelector:
+        if self.provider == "anthropic":
+            if not self.model_id or any(char in self.model_id for char in " ^$[]()*+?\\"):
+                raise ValueError(
+                    f"{self.alias} uses the Anthropic API and needs a literal model_id"
+                )
+            if not self.effort:
+                raise ValueError(f"{self.alias} needs an explicit Anthropic effort level")
+            return self
+        if self.model_id or self.effort:
+            raise ValueError("model_id and effort are only valid for provider anthropic")
+        return self
 
 
 class Budgets(StrictModel):
@@ -31,6 +52,7 @@ class Budgets(StrictModel):
     max_h200_evaluations: int = Field(ge=1, le=5)
     max_total_tokens: int = Field(ge=1)
     max_wall_seconds: int = Field(ge=1)
+    no_improvement_streak_to_stop: int = Field(default=2, ge=1, le=5)
 
 
 class EvaluationConfig(StrictModel):
@@ -64,7 +86,7 @@ class LanguageTarget(StrictModel):
     editable_paths: list[str]
     public_test_command: str
     prompt_path: str
-    backend: Literal["cpu", "cuda", "ka"] = "ka"
+    backend: Literal["cpu", "cuda", "ka", "opencl"] = "ka"
     requires_gpu: bool = True
     evaluate_locally: bool = False
     workspace_paths: list[str] = Field(default_factory=list)
@@ -239,6 +261,14 @@ class TrialRecord(StrictModel):
     token_usage: TokenRecord
     incumbent_candidate_id: str | None = None
     incumbent_speedup: float | None = None
+    first_correct_iteration: int | None = Field(
+        default=None,
+        description="First agent iteration whose H200 evaluation passed the full correctness gate.",
+    )
+    tokens_to_correctness: int | None = Field(
+        default=None,
+        description="Cumulative agent tokens through the first fully correct H200 evaluation.",
+    )
     termination_reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
