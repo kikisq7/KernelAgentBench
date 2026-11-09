@@ -367,7 +367,7 @@ def manifest_evaluator_args(manifest: CandidateManifest, output: Path) -> list[s
                 str(manifest.evaluation.float64_rtol),
             ]
         )
-    elif manifest.language == "cpp":
+    elif manifest.language in {"cpp", "cpp-cpu"}:
         args.extend(
             [
                 "--correctness-dtypes",
@@ -381,20 +381,22 @@ def manifest_evaluator_args(manifest: CandidateManifest, output: Path) -> list[s
     return args
 
 
-def evaluate_candidate_local(project: Path, workspace: Path, bundle: Path) -> Path:
-    manifest = CandidateManifest.model_validate_json(
-        (bundle / "manifest.json").read_text(encoding="utf-8")
-    )
-    if not is_julia_language(manifest.language):
-        raise ValueError(f"local evaluation is Julia-only; got {manifest.language}")
-    output = project / "results" / f"{manifest.candidate_id}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "julia",
-        f"--project={workspace / 'julia'}",
-        str(workspace / "julia" / "evaluate_candidate.jl"),
-        *manifest_evaluator_args(manifest, output),
+def cpp_cpu_compile_command(workspace: Path, binary: Path) -> list[str]:
+    """Host C++ CPU evaluator. No OpenCL: this track is the CPU comparison."""
+    source = workspace / "cpp" / "evaluate_cpu.cpp"
+    include = workspace / "cpp" / "gray_scott" / "cpu"
+    return [
+        "g++",
+        "-O3",
+        "-std=c++17",
+        f"-I{include}",
+        str(source),
+        "-o",
+        str(binary),
     ]
+
+
+def _run_local_evaluator(command: list[str], workspace: Path, output: Path) -> Path:
     completed = subprocess.run(
         command,
         cwd=workspace,
@@ -411,6 +413,52 @@ def evaluate_candidate_local(project: Path, workspace: Path, bundle: Path) -> Pa
             f"{shlex.join(command)}\n{detail}"
         )
     return output
+
+
+def evaluate_candidate_local(project: Path, workspace: Path, bundle: Path) -> Path:
+    manifest = CandidateManifest.model_validate_json(
+        (bundle / "manifest.json").read_text(encoding="utf-8")
+    )
+    output = project / "results" / f"{manifest.candidate_id}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if manifest.language == "cpp-cpu":
+        binary_dir = project / ".kernel-agent-bench" / "build"
+        binary_dir.mkdir(parents=True, exist_ok=True)
+        binary = binary_dir / f"evaluate_cpu_{manifest.candidate_id}"
+        compile_command = cpp_cpu_compile_command(workspace, binary)
+        compile_started = time.perf_counter()
+        compiled = subprocess.run(
+            compile_command,
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        compile_seconds = time.perf_counter() - compile_started
+        if compiled.returncode != 0 or not binary.is_file():
+            detail = "\n".join(
+                part.strip() for part in (compiled.stderr, compiled.stdout) if part
+            ).strip()
+            raise RuntimeError(
+                f"C++ CPU evaluator failed to compile ({compiled.returncode}): "
+                f"{shlex.join(compile_command)}\n{detail}"
+            )
+        command = [
+            str(binary),
+            *manifest_evaluator_args(manifest, output),
+            "--compile-seconds",
+            f"{compile_seconds:.6f}",
+        ]
+        return _run_local_evaluator(command, workspace, output)
+    if not is_julia_language(manifest.language):
+        raise ValueError(f"local evaluation supports Julia and cpp-cpu; got {manifest.language}")
+    command = [
+        "julia",
+        f"--project={workspace / 'julia'}",
+        str(workspace / "julia" / "evaluate_candidate.jl"),
+        *manifest_evaluator_args(manifest, output),
+    ]
+    return _run_local_evaluator(command, workspace, output)
 
 
 def render_slurm(

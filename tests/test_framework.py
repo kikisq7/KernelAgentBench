@@ -19,6 +19,7 @@ from kernel_agent_bench.orcd import (
     remote_eval_command,
     remote_mkdir_command,
     remote_transfer,
+    cpp_cpu_compile_command,
     render_slurm,
     rsync_download_command,
     rsync_ssh,
@@ -134,6 +135,51 @@ def test_orcd_required_fields_and_salloc_flags() -> None:
         "-p",
     ]
     assert salloc_command(config, wall_time="04:00:00")[10] == "04:00:00"
+
+
+def test_cpp_cpu_compiles_without_opencl(tmp_path: Path) -> None:
+    workspace = tmp_path / "KernelAgentBench"
+    command = cpp_cpu_compile_command(workspace, tmp_path / "evaluate_cpu")
+    assert command[:4] == ["g++", "-O3", "-std=c++17", f"-I{workspace / 'cpp' / 'gray_scott' / 'cpu'}"]
+    assert str(workspace / "cpp" / "evaluate_cpu.cpp") in command
+    assert "-lOpenCL" not in command
+    bundle = workspace / "candidates" / "candidate-1"
+    bundle.mkdir(parents=True)
+    (bundle / "candidate.patch").write_text("patch", encoding="utf-8")
+    manifest = CandidateManifest(
+        candidate_id="candidate-1",
+        trial_id="trial-1",
+        baseline_commit="abc123",
+        patch_sha256="0" * 64,
+        patch_file="candidate.patch",
+        iteration=1,
+        language="cpp-cpu",
+        task_version="test",
+        study_hash="1" * 64,
+        prompt_sha256="2" * 64,
+        evaluation=_study().evaluation,
+    )
+    (bundle / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+    config = OrcdConfig(
+        partition="mit_normal_gpu",
+        gpu_request="h200:1",
+        nodes=1,
+        ntasks=1,
+        cpus_per_task=1,
+        memory="8GB",
+        wall_time="00:20:00",
+        scratch_root="/scratch/user",
+        ssh_host="orcd-login.mit.edu",
+        ssh_user="user",
+        remote_project="/home/user/UROPJulia/KernelAgentBench",
+    )
+    with pytest.raises(ValueError, match="cpp-cpu"):
+        render_slurm(
+            config,
+            project=workspace,
+            bundle=bundle,
+            result=workspace / "results" / "candidate-1.json",
+        )
 
 
 def test_persist_and_parse_held_salloc(tmp_path: Path) -> None:

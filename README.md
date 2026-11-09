@@ -139,7 +139,7 @@ kernel-agent-bench start \
   --baseline HEAD
 ```
 
-`--language` is one of `julia-ka`, `julia-cuda`, or `julia-cpu`. The graph runs
+`--language` is one of `julia-ka`, `julia-cuda`, `julia-cpu`, `cpp`, or `cpp-cpu`. The graph runs
 one coding-agent turn, executes that backend's public tests, validates that
 only that backend's candidate file changed, packages the binary Git patch, and
 either evaluates or stops with status `awaiting_h200_result`.
@@ -149,6 +149,8 @@ Editable files:
 - `kernels/gray_scott/ka/candidate.jl`
 - `kernels/gray_scott/cuda/candidate.jl`
 - `kernels/gray_scott/cpu/candidate.jl`
+- `cpp/gray_scott/candidate_kernel.cl` (OpenCL on the H200)
+- `cpp/gray_scott/cpu/candidate.hpp` (host CPU, scored locally)
 
 The agent cwd is a temp copy of that backend's `workspace_paths` only.
 
@@ -169,9 +171,11 @@ kernel-agent-bench resume \
 Each trial is capped at **five** agent turns and **five** scored evaluations.
 The graph keeps the best correct incumbent and continues only when geometric-mean
 speedup improves by at least 5% over that incumbent (or over 1.0× on the first
-try). A correct candidate that is slower, equal, or only marginally faster ends
-the trial early with `no_significant_improvement`. Incorrect candidates may
-still be repaired until the cap. `julia-cpu` evaluations run locally.
+try). After **two consecutive** correct evaluations that fail that bar, the trial
+ends with `no_significant_improvement` (configurable via
+`budgets.no_improvement_streak_to_stop`, default 2). Incorrect candidates may
+still be repaired until the cap. `julia-cpu` and `cpp-cpu` evaluations run locally
+on the host CPU. `cpp` stays OpenCL on the H200.
 
 ## ORCD H200 (CUDA.jl and KernelAbstractions GPU)
 

@@ -572,7 +572,7 @@ class TrialGraph:
                     f"result language {result.language} does not match {state['language']}"
                 )
             if result.status != "error" and (
-                is_julia_language(result.language) or result.language == "cpp"
+                is_julia_language(result.language) or result.language in {"cpp", "cpp-cpu"}
             ):
                 target = self._target(study, state["language"])
                 expected = (target.evaluation or study.evaluation).correctness_dtypes
