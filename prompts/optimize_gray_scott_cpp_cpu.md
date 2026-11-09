@@ -20,7 +20,8 @@ Caveats:
   or any GPU API.
 - For thread parallelism, use `std::thread` from the C++17 standard library.
   Do not require OpenMP, TBB, or a nonstandard runtime. The initial candidate
-  partitions rows with `cpu_parallel_rows`.
+  partitions rows with `cpu_parallel_rows`, which runs on a persistent thread
+  team shared with the baseline.
 
 This is the current benchmarking status of the parallel algorithms:
 [Benchmark Output]

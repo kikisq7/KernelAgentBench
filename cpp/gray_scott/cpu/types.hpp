@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -65,33 +68,106 @@ inline CpuGrayScottState<T> cpu_initialize_fields(int height, int width, int see
     return state;
 }
 
+// Persistent worker team, the C++ counterpart of Polyester's thread pool in the
+// Julia CPU baseline. Threads live for the whole process, so a timestep pays a
+// wake-up and a join barrier, not thread creation.
+class CpuThreadTeam {
+public:
+    explicit CpuThreadTeam(int size) : size_(std::max(1, size)) {
+        for (int index = 1; index < size_; ++index) {
+            threads_.emplace_back([this, index] { work(index); });
+        }
+    }
+
+    ~CpuThreadTeam() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+            ++generation_;
+        }
+        wake_.notify_all();
+        for (std::thread& thread : threads_) {
+            thread.join();
+        }
+    }
+
+    CpuThreadTeam(const CpuThreadTeam&) = delete;
+    CpuThreadTeam& operator=(const CpuThreadTeam&) = delete;
+
+    void run(int begin, int end, const std::function<void(int, int)>& body) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            body_ = &body;
+            begin_ = begin;
+            end_ = end;
+            pending_ = size_ - 1;
+            ++generation_;
+        }
+        wake_.notify_all();
+        chunk(0);
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [this] { return pending_ == 0; });
+        body_ = nullptr;
+    }
+
+private:
+    void chunk(int index) {
+        const int rows = end_ - begin_;
+        const int per = (rows + size_ - 1) / size_;
+        const int start = begin_ + index * per;
+        const int stop = std::min(end_, start + per);
+        if (start < stop) {
+            (*body_)(start, stop);
+        }
+    }
+
+    void work(int index) {
+        unsigned long seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [&] { return generation_ != seen; });
+                seen = generation_;
+                if (stop_) {
+                    return;
+                }
+            }
+            chunk(index);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (--pending_ == 0) {
+                done_.notify_one();
+            }
+        }
+    }
+
+    int size_;
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::condition_variable done_;
+    const std::function<void(int, int)>* body_ = nullptr;
+    int begin_ = 0;
+    int end_ = 0;
+    int pending_ = 0;
+    unsigned long generation_ = 0;
+    bool stop_ = false;
+};
+
+inline CpuThreadTeam& cpu_thread_team() {
+    static CpuThreadTeam team([] {
+        const unsigned hardware = std::thread::hardware_concurrency();
+        return hardware == 0 ? 1 : static_cast<int>(hardware);
+    }());
+    return team;
+}
+
 template <typename Fn>
 inline void cpu_parallel_rows(int y_begin, int y_end, Fn&& body) {
-    const int rows = y_end - y_begin;
-    if (rows <= 0) {
+    if (y_end <= y_begin) {
         return;
     }
-    const unsigned hardware = std::thread::hardware_concurrency();
-    int workers = hardware == 0 ? 1 : static_cast<int>(hardware);
-    workers = std::max(1, std::min(workers, rows));
-    if (workers == 1) {
-        body(y_begin, y_end);
-        return;
-    }
-    std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(workers));
-    const int chunk = (rows + workers - 1) / workers;
-    for (int worker = 0; worker < workers; ++worker) {
-        const int start = y_begin + worker * chunk;
-        const int stop = std::min(y_end, start + chunk);
-        if (start >= stop) {
-            break;
-        }
-        threads.emplace_back(body, start, stop);
-    }
-    for (std::thread& thread : threads) {
-        thread.join();
-    }
+    const std::function<void(int, int)> rows = [&body](int start, int stop) { body(start, stop); };
+    cpu_thread_team().run(y_begin, y_end, rows);
 }
 
 // Serial oracle. Correctness compares the parallel candidate with this, not

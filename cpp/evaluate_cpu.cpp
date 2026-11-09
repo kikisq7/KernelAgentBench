@@ -208,7 +208,9 @@ void write_result(
     double end_to_end_seconds,
     const std::string& error
 ) {
-    std::filesystem::create_directories(path.parent_path());
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
     std::ofstream output(path);
     output << std::setprecision(10);
     double log_speedup = 0.0;

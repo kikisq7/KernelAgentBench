@@ -328,7 +328,8 @@ class TrialGraph:
                         }
                     )
                 add_trace_outputs(span, outputs, study.trace_content)
-            if run.status not in {"finished", "success"}:
+            # A turn that exhausts the tool-turn cap keeps its edits and is scored.
+            if run.status not in {"finished", "success", "error_max_turns"}:
                 raise RuntimeError(
                     f"Agent run failed with status {run.status}: {run.response}"
                 )

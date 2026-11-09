@@ -853,7 +853,8 @@ def test_agent_workspace_excludes_other_backends(tmp_path: Path) -> None:
         graph.close()
 
 
-def test_cpu_backend_evaluates_locally(tmp_path: Path) -> None:
+@pytest.mark.parametrize("agent_status", ["finished", "error_max_turns"])
+def test_cpu_backend_evaluates_locally(tmp_path: Path, agent_status: str) -> None:
     repository = tmp_path / "repo"
     project = repository / "KernelAgentBench"
     candidate = project / "kernels" / "gray_scott" / "cpu" / "candidate.jl"
@@ -877,7 +878,7 @@ def test_cpu_backend_evaluates_locally(tmp_path: Path) -> None:
             "baseline = false\n", encoding="utf-8"
         )
         return AgentRun(
-            status="finished",
+            status=agent_status,
             agent_id="agent-test",
             run_id="run-test",
             response="changed candidate",
