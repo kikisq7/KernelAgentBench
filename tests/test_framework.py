@@ -301,6 +301,7 @@ def test_slurm_renderer_freezes_candidate_evaluation(
     if language == "python-triton":
         assert "--backend triton" in script
         assert '"$KAB_TRITON_VENV/bin/python"' in script
+        assert 'import numpy, torch, triton' in script
         assert "python/requirements-gpu.txt" in script
     remote_script = render_slurm(
         config,

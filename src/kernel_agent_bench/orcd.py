@@ -502,8 +502,9 @@ def render_slurm(
                 *([setup] if setup else []),
                 *config.python_setup_commands,
                 f'KAB_TRITON_VENV={venv}',
-                'if [ ! -x "$KAB_TRITON_VENV/bin/python" ]; then',
-                '  python3 -m venv "$KAB_TRITON_VENV"',
+                'if ! "$KAB_TRITON_VENV/bin/python" -c "import numpy, torch, triton" '
+                "2>/dev/null; then",
+                '  python3 -m venv --clear "$KAB_TRITON_VENV"',
                 '  "$KAB_TRITON_VENV/bin/pip" install --quiet --upgrade pip',
                 '  "$KAB_TRITON_VENV/bin/pip" install --quiet -r '
                 + shlex.quote(f"{relative_project}/python/requirements-gpu.txt"),
