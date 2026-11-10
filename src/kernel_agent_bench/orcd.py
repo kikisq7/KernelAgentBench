@@ -10,7 +10,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .schemas import CandidateManifest, OrcdConfig, is_julia_language, julia_backend_for_language
+from .schemas import (
+    CandidateManifest,
+    OrcdConfig,
+    is_julia_language,
+    julia_backend_for_language,
+    python_backend_for_language,
+)
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
@@ -329,71 +335,62 @@ def _run(command: list[str], *, input_text: str | None = None) -> None:
 
 
 def manifest_evaluator_args(manifest: CandidateManifest, output: Path) -> list[str]:
+    """One command line for every evaluator; each ignores options it does not use."""
+    evaluation = manifest.evaluation
     args = [
         "--candidate-id",
         manifest.candidate_id,
         "--output",
         output.as_posix() if output.is_absolute() else str(output),
+        "--language",
+        manifest.language,
         "--dtype",
-        manifest.evaluation.dtype,
+        evaluation.dtype,
         "--shapes",
-        ",".join(f"{height}x{width}" for height, width in manifest.evaluation.performance_shapes),
+        ",".join(f"{nx}x{ny}" for nx, ny in evaluation.performance_shapes),
         "--correctness-shapes",
-        ",".join(f"{height}x{width}" for height, width in manifest.evaluation.correctness_shapes),
+        ",".join(f"{nx}x{ny}" for nx, ny in evaluation.correctness_shapes),
         "--steps",
-        str(manifest.evaluation.steps),
+        str(evaluation.steps),
         "--warmups",
-        str(manifest.evaluation.warmups),
+        str(evaluation.warmups),
         "--repetitions",
-        str(manifest.evaluation.repetitions),
+        str(evaluation.repetitions),
         "--atol",
-        str(manifest.evaluation.atol),
+        str(evaluation.atol),
         "--rtol",
-        str(manifest.evaluation.rtol),
+        str(evaluation.rtol),
     ]
-    backend = julia_backend_for_language(manifest.language)
+    if evaluation.cpu_threads:
+        args.extend(["--threads", str(evaluation.cpu_threads)])
+    backend = julia_backend_for_language(manifest.language) or python_backend_for_language(
+        manifest.language
+    )
     if backend is not None:
-        args.extend(
-            [
-                "--language",
-                manifest.language,
-                "--backend",
-                backend,
-                "--correctness-dtypes",
-                ",".join(manifest.evaluation.correctness_dtypes),
-                "--atol64",
-                str(manifest.evaluation.float64_atol),
-                "--rtol64",
-                str(manifest.evaluation.float64_rtol),
-            ]
-        )
-    elif manifest.language in {"cpp", "cpp-cpu"}:
-        args.extend(
-            [
-                "--correctness-dtypes",
-                ",".join(manifest.evaluation.correctness_dtypes),
-                "--atol64",
-                str(manifest.evaluation.float64_atol),
-                "--rtol64",
-                str(manifest.evaluation.float64_rtol),
-            ]
-        )
+        args.extend(["--backend", backend])
     return args
 
 
+# -ffp-contract=off keeps the notebook's arithmetic: Julia never fuses a*b+c on its own.
 def cpp_cpu_compile_command(workspace: Path, binary: Path) -> list[str]:
     """Host C++ CPU evaluator. No OpenCL: this track is the CPU comparison."""
-    source = workspace / "cpp" / "evaluate_cpu.cpp"
-    include = workspace / "cpp" / "gray_scott" / "cpu"
     return [
         "g++",
         "-O3",
         "-std=c++17",
-        f"-I{include}",
-        str(source),
+        f"-I{workspace / 'cpp' / 'gray_scott' / 'cpu'}",
+        "-ffp-contract=off",
+        str(workspace / "cpp" / "evaluate_cpu.cpp"),
         "-o",
         str(binary),
     ]
+
+
+def julia_command(workspace: Path, threads: int) -> list[str]:
+    command = ["julia", f"--project={workspace / 'julia'}"]
+    if threads:
+        command.insert(1, f"--threads={threads}")
+    return command + [str(workspace / "julia" / "evaluate_candidate.jl")]
 
 
 def _run_local_evaluator(command: list[str], workspace: Path, output: Path) -> Path:
@@ -450,12 +447,19 @@ def evaluate_candidate_local(project: Path, workspace: Path, bundle: Path) -> Pa
             f"{compile_seconds:.6f}",
         ]
         return _run_local_evaluator(command, workspace, output)
+    if manifest.language == "python-cpu":
+        command = [
+            sys.executable,
+            str(workspace / "python" / "evaluate_candidate.py"),
+            *manifest_evaluator_args(manifest, output),
+        ]
+        return _run_local_evaluator(command, workspace, output)
     if not is_julia_language(manifest.language):
-        raise ValueError(f"local evaluation supports Julia and cpp-cpu; got {manifest.language}")
+        raise ValueError(
+            f"local evaluation supports Julia, cpp-cpu, and python-cpu; got {manifest.language}"
+        )
     command = [
-        "julia",
-        f"--project={workspace / 'julia'}",
-        str(workspace / "julia" / "evaluate_candidate.jl"),
+        *julia_command(workspace, manifest.evaluation.cpu_threads),
         *manifest_evaluator_args(manifest, output),
     ]
     return _run_local_evaluator(command, workspace, output)
@@ -477,7 +481,7 @@ def render_slurm(
     if not local_patch.is_file():
         raise FileNotFoundError(local_patch)
     patch = patch_path or local_patch
-    repository = _normalize_abs((repository or project))
+    repository = _normalize_abs(repository or project)
     relative_project = _normalize_abs(project).relative_to(repository)
     scratch = Path(config.scratch_root) / "kernel-agent-bench"
     setup = "\n".join(config.setup_commands)
@@ -491,6 +495,21 @@ def render_slurm(
         )
     elif manifest.language == "cpp":
         setup = setup + ("\n" if setup else "") + "module load gcc"
+    elif manifest.language == "python-triton":
+        venv = config.triton_venv
+        setup = "\n".join(
+            [
+                *([setup] if setup else []),
+                *config.python_setup_commands,
+                f'KAB_TRITON_VENV={venv}',
+                'if [ ! -x "$KAB_TRITON_VENV/bin/python" ]; then',
+                '  python3 -m venv "$KAB_TRITON_VENV"',
+                '  "$KAB_TRITON_VENV/bin/pip" install --quiet --upgrade pip',
+                '  "$KAB_TRITON_VENV/bin/pip" install --quiet -r '
+                + shlex.quote(f"{relative_project}/python/requirements-gpu.txt"),
+                "fi",
+            ]
+        )
     evaluator_args = manifest_evaluator_args(manifest, _normalize_abs(result))
     if is_julia_language(manifest.language):
         executable = [
@@ -499,17 +518,17 @@ def render_slurm(
             f"{relative_project}/julia/evaluate_candidate.jl",
         ]
         command = " ".join(shlex.quote(value) for value in executable + evaluator_args)
-    elif manifest.language == "python":
-        executable = ["python3", f"{relative_project}/python/evaluate_candidate.py"]
-        command = " ".join(shlex.quote(value) for value in executable + evaluator_args)
+    elif manifest.language == "python-triton":
+        command = (
+            '"$KAB_TRITON_VENV/bin/python" '
+            + shlex.quote(f"{relative_project}/python/evaluate_candidate.py")
+            + " "
+            + " ".join(shlex.quote(value) for value in evaluator_args)
+        )
     elif manifest.language == "cpp":
-        if manifest.evaluation.dtype != "Float32":
-            raise ValueError("the OpenCL C++ evaluator currently supports Float32 only")
         binary = f"{relative_project}/.build/evaluate_candidate_cpp"
         source = f"{relative_project}/cpp/evaluate_candidate.cpp"
-        run_args = evaluator_args.copy()
-        dtype_index = run_args.index("--dtype")
-        del run_args[dtype_index : dtype_index + 2]
+        run_args = evaluator_args
         command = (
             f'mkdir -p "$(dirname {binary})"\n'
             "COMPILE_STARTED=$(date +%s%N)\n"
@@ -875,7 +894,7 @@ def _evaluate_candidate_remote_impl(
         _run(rsync_download_command(config, transfer))
     except RuntimeError:
         if eval_error is not None:
-            raise eval_error
+            raise eval_error from None
         raise
     if transfer.local_result.is_file():
         return transfer.local_result

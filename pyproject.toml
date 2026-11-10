@@ -5,15 +5,17 @@ build-backend = "hatchling.build"
 [project]
 name = "kernel-agent-bench"
 version = "0.1.0"
-description = "Reproducible coding-agent evaluation for Julia CPU, CUDA.jl, and KernelAbstractions kernels"
+description = "Reproducible coding-agent evaluation of Gray-Scott kernels in Julia, C++, and Python"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "claude-agent-sdk>=0.1.0",
   "cursor-sdk>=0.3.0",
   "langchain-core>=0.3.70",
   "langgraph>=0.6.0",
   "langgraph-checkpoint-sqlite>=2.0",
   "langsmith>=0.4.0",
+  "numba>=0.60",
   "numpy>=2.0",
   "pydantic>=2.10",
   "PyYAML>=6.0.2",
@@ -21,9 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = [
-  "numba-cuda[cu12]>=0.19",
-]
 dev = [
   "mypy>=1.15",
   "pytest>=8.3",

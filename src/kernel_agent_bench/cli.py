@@ -83,6 +83,13 @@ def start(
                 "Claude trials call the Anthropic API and do not use CURSOR_API_KEY."
             )
         os.environ["KAB_ANTHROPIC_EFFORT"] = selectors[0].effort
+    if selectors[0].provider == "openai":
+        if not (os.environ.get("OPENAI_API_KEY") or "").strip():
+            raise typer.BadParameter(
+                "OPENAI_API_KEY is missing from KernelAgentBench/.env. "
+                "GPT trials call the OpenAI API and do not use CURSOR_API_KEY."
+            )
+        os.environ["KAB_OPENAI_EFFORT"] = selectors[0].effort
     resolved = discover_models(selectors)
     orcd = load_orcd(orcd_path) if orcd_path else None
     if orcd and orcd.auto_evaluate:

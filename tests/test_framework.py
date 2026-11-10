@@ -14,12 +14,12 @@ from kernel_agent_bench.models import AgentRun, resolve_model_ids
 from kernel_agent_bench.orcd import (
     _parse_salloc_job_id,
     _parse_sbatch_job_id,
+    cpp_cpu_compile_command,
     persist_salloc_job_id,
     remote_commit_command,
     remote_eval_command,
     remote_mkdir_command,
     remote_transfer,
-    cpp_cpu_compile_command,
     render_slurm,
     rsync_download_command,
     rsync_ssh,
@@ -89,6 +89,49 @@ def test_anthropic_models_skip_the_cursor_catalog() -> None:
     assert record.reasoning_tokens == 7
 
 
+def test_openai_models_skip_the_cursor_catalog() -> None:
+    from kernel_agent_bench.models import (
+        parse_codex_events,
+        resolve_configured_models,
+        uses_openai,
+    )
+
+    gpt = ModelSelector(
+        alias="gpt-6-astra",
+        match="^gpt-6-astra$",
+        provider="openai",
+        model_id="gpt-6-astra",
+        effort="high",
+    )
+    assert resolve_configured_models([gpt], []) == {"gpt-6-astra": "gpt-6-astra"}
+    assert uses_openai("gpt-6-astra")
+    with pytest.raises(ValueError, match="explicit OpenAI effort"):
+        ModelSelector(alias="gpt", match="^gpt", provider="openai", model_id="gpt-6-astra")
+    with pytest.raises(ValueError, match="no 'max' effort"):
+        ModelSelector(
+            alias="gpt", match="^gpt", provider="openai", model_id="gpt-6-astra", effort="max"
+        )
+
+    turn = parse_codex_events(
+        [
+            "Reading additional input from stdin...",
+            '{"type":"thread.started","thread_id":"t-1"}',
+            '{"type":"error","message":"Reconnecting... 1/5"}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+            '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,'
+            '"output_tokens":20,"reasoning_output_tokens":12}}',
+        ]
+    )
+    assert (turn.thread_id, turn.response, turn.failure) == ("t-1", "done", "")
+    from kernel_agent_bench.models import openai_token_record
+
+    record = openai_token_record(turn.usage)
+    assert (record.input_tokens, record.cache_read_tokens) == (40, 60)
+    assert record.total_tokens == 120
+    assert record.reasoning_tokens == 12
+    assert parse_codex_events(['{"type":"turn.failed","error":{"message":"x"}}']).usage is None
+
+
 def test_model_resolution_rejects_duplicates_and_missing() -> None:
     with pytest.raises(ValueError, match="no Cursor model"):
         resolve_model_ids([ModelSelector(alias="gpt", match="^gpt-5.6")], ["gpt-5.5"])
@@ -140,7 +183,8 @@ def test_orcd_required_fields_and_salloc_flags() -> None:
 def test_cpp_cpu_compiles_without_opencl(tmp_path: Path) -> None:
     workspace = tmp_path / "KernelAgentBench"
     command = cpp_cpu_compile_command(workspace, tmp_path / "evaluate_cpu")
-    assert command[:4] == ["g++", "-O3", "-std=c++17", f"-I{workspace / 'cpp' / 'gray_scott' / 'cpu'}"]
+    include = f"-I{workspace / 'cpp' / 'gray_scott' / 'cpu'}"
+    assert command[:4] == ["g++", "-O3", "-std=c++17", include]
     assert str(workspace / "cpp" / "evaluate_cpu.cpp") in command
     assert "-lOpenCL" not in command
     bundle = workspace / "candidates" / "candidate-1"
@@ -198,7 +242,7 @@ def test_persist_and_parse_held_salloc(tmp_path: Path) -> None:
         ("julia-ka", "--backend ka"),
         ("julia-cpu", "--backend cpu"),
         ("julia-cuda", "--backend cuda"),
-        ("python", "python/evaluate_candidate.py"),
+        ("python-triton", "python/evaluate_candidate.py"),
         ("cpp", "g++ -O3 -std=c++17"),
     ],
 )
@@ -253,8 +297,11 @@ def test_slurm_renderer_freezes_candidate_evaluation(
     assert "--correctness-shapes 5x5" in script
     assert "--steps 1" in script
     assert expected_command in script
-    if language == "cpp":
-        assert "--correctness-dtypes Float32,Float64" in script
+    assert f"--language {language}" in script
+    if language == "python-triton":
+        assert "--backend triton" in script
+        assert '"$KAB_TRITON_VENV/bin/python"' in script
+        assert "python/requirements-gpu.txt" in script
     remote_script = render_slurm(
         config,
         project=Path("/home/user/UROPJulia/KernelAgentBench"),
@@ -432,7 +479,7 @@ def _study(
         "julia-cuda": "cuda",
         "julia-ka": "ka",
         "julia": "cuda",
-        "python": "cuda",
+        "python-triton": "triton",
         "cpp": "opencl",
     }.get(language, "ka")
     default_editable = {
@@ -440,7 +487,7 @@ def _study(
         "julia-cuda": "kernels/gray_scott/cuda/candidate.jl",
         "julia-ka": "kernels/gray_scott/ka/candidate.jl",
         "julia": "kernels/gray_scott/cuda/candidate.jl",
-        "python": "python/gray_scott/candidate.py",
+        "python-triton": "python/gray_scott/gpu/candidate.py",
         "cpp": "cpp/gray_scott/candidate_kernel.cl",
     }.get(language, "kernels/gray_scott/ka/candidate.jl")
     local = backend == "cpu" if evaluate_locally is None else evaluate_locally
@@ -1068,7 +1115,8 @@ def test_cpp_opencl_packages_candidate(tmp_path: Path) -> None:
         "gray_scott/baseline.hpp",
         "gray_scott/candidate.hpp",
         "gray_scott/opencl_common.hpp",
-        "gray_scott/opencl_runner.hpp",
+        "gray_scott/notebook.hpp",
+        "eval_common.hpp",
         "evaluate_candidate.cpp",
     ):
         src = cpp_tree / relative
@@ -1112,18 +1160,76 @@ def test_cpp_opencl_packages_candidate(tmp_path: Path) -> None:
     manager.cleanup_worktree(worktree.root)
 
 
-def test_study_example_is_julia_backends() -> None:
+def test_study_example_covers_notebook_tracks() -> None:
     from kernel_agent_bench.config import load_study, project_root
 
-    study = load_study(project_root() / "config" / "study.example.yaml")
-    assert [target.id for target in study.languages] == [
-        "julia-ka",
-        "julia-cuda",
-        "julia-cpu",
+    root = project_root()
+    study = load_study(root / "config" / "study.example.yaml")
+    assert {target.id: target.backend for target in study.languages} == {
+        "julia-cpu": "cpu",
+        "julia-cuda": "cuda",
+        "julia-ka": "ka",
+        "cpp-cpu": "cpu",
+        "cpp": "opencl",
+        "python-cpu": "cpu",
+        "python-triton": "triton",
+    }
+    assert study.evaluation.dtype == "Float64"
+    for target in study.languages:
+        evaluation = target.evaluation or study.evaluation
+        assert evaluation.correctness_dtypes == ["Float64"]
+        assert target.evaluate_locally is (target.backend == "cpu")
+        assert target.requires_gpu is (target.backend != "cpu")
+        if target.backend == "cpu":
+            assert evaluation.cpu_threads == 4
+        for path in [*target.editable_paths, *target.workspace_paths, target.prompt_path]:
+            assert (root / path).exists(), path
+
+
+def test_every_evaluator_gets_the_same_arguments(tmp_path: Path) -> None:
+    from kernel_agent_bench.orcd import julia_command, manifest_evaluator_args
+
+    evaluation = _study().evaluation.model_copy(update={"cpu_threads": 4})
+    for language, backend in [
+        ("julia-cpu", "cpu"),
+        ("python-cpu", "cpu"),
+        ("python-triton", "triton"),
+        ("cpp-cpu", None),
+    ]:
+        manifest = CandidateManifest(
+            candidate_id="candidate-1",
+            trial_id="trial-1",
+            baseline_commit="abc123",
+            patch_sha256="0" * 64,
+            patch_file="candidate.patch",
+            iteration=1,
+            language=language,
+            task_version="test",
+            study_hash="1" * 64,
+            prompt_sha256="2" * 64,
+            evaluation=evaluation,
+        )
+        args = manifest_evaluator_args(manifest, tmp_path / "out.json")
+        assert args[args.index("--language") + 1] == language
+        assert args[args.index("--threads") + 1] == "4"
+        assert ("--backend" in args) is (backend is not None)
+        if backend:
+            assert args[args.index("--backend") + 1] == backend
+    assert julia_command(tmp_path, 4)[:2] == ["julia", "--threads=4"]
+    assert "--threads=0" not in julia_command(tmp_path, 0)
+
+
+def test_python_public_tests_use_the_harness_interpreter() -> None:
+    import sys
+
+    from kernel_agent_bench.graph import public_test_argv
+
+    assert public_test_argv("python3 python/tests/run_tests.py cpu") == [
+        sys.executable,
+        "python/tests/run_tests.py",
+        "cpu",
     ]
-    assert [target.backend for target in study.languages] == ["ka", "cuda", "cpu"]
-    assert study.languages[0].requires_gpu is True
-    assert study.languages[2].evaluate_locally is True
+    assert public_test_argv("bash cpp/test/run_cpu_tests.sh")[0] == "bash"
 
 
 def test_budgets_are_capped_at_five_tries() -> None:

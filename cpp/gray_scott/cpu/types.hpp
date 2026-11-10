@@ -1,76 +1,30 @@
 #pragma once
 
+#include "../notebook.hpp"
+
 #include <algorithm>
-#include <cmath>
 #include <condition_variable>
-#include <cstddef>
 #include <functional>
 #include <mutex>
-#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
 
-// Host Gray-Scott types shared by the C++ CPU baseline, candidate, and evaluator.
-// The timed kernels live in baseline.hpp and candidate.hpp. This header is the
-// serial reference and the row partition used by the initial parallel code.
+// Host state and the thread pool shared by the C++ CPU baseline, candidate, and
+// evaluator. The timed code lives in baseline.hpp and candidate.hpp.
 
-template <typename T>
-struct CpuGrayScottParams {
-    T diffusion_u = T(0.16);
-    T diffusion_v = T(0.08);
-    T feed = T(0.035);
-    T kill = T(0.065);
-    T dt = T(1);
-};
+using CpuGrayScottState = GrayScottFields;
 
-template <typename T>
-struct CpuGrayScottState {
-    int height = 0;
-    int width = 0;
-    std::vector<T> u;
-    std::vector<T> v;
-    std::vector<T> u_next;
-    std::vector<T> v_next;
-};
-
-template <typename T>
-inline CpuGrayScottState<T> cpu_initialize_fields(int height, int width, int seed = 20260918) {
-    if (height < 5 || width < 5) {
-        throw std::invalid_argument("shape must be at least 5x5");
-    }
-    const std::size_t count = static_cast<std::size_t>(height) * static_cast<std::size_t>(width);
-    CpuGrayScottState<T> state;
-    state.height = height;
-    state.width = width;
-    state.u.assign(count, T(1));
-    state.v.assign(count, T(0));
-    state.u_next.resize(count);
-    state.v_next.resize(count);
-    const int radius_y = std::max(1, height / 10);
-    const int radius_x = std::max(1, width / 10);
-    const int center_y = (height - 1) / 2;
-    const int center_x = (width - 1) / 2;
-    for (int y = std::max(1, center_y - radius_y);
-         y <= std::min(height - 2, center_y + radius_y);
-         ++y) {
-        for (int x = std::max(1, center_x - radius_x);
-             x <= std::min(width - 2, center_x + radius_x);
-             ++x) {
-            const T noise = T(0.01) * std::sin(
-                (T(y + 1) * T(73856093) + T(x + 1) * T(19349663) + T(seed)) * T(0.001)
-            );
-            const int index = y * width + x;
-            state.u[static_cast<std::size_t>(index)] = T(0.5) + noise;
-            state.v[static_cast<std::size_t>(index)] = T(0.25) - noise;
-        }
-    }
-    return state;
+// Worker count for every parallel loop. The evaluator sets it from --threads
+// before the first loop runs; 0 means std::thread::hardware_concurrency().
+inline int& cpu_thread_count() {
+    static int count = 0;
+    return count;
 }
 
-// Persistent worker team, the C++ counterpart of Polyester's thread pool in the
-// Julia CPU baseline. Threads live for the whole process, so a timestep pays a
-// wake-up and a join barrier, not thread creation.
+// Persistent worker team: the C++ counterpart of Julia's thread pool behind
+// Threads.@threads. Threads live for the whole process, so a parallel loop pays
+// a wake-up and a join barrier, not thread creation.
 class CpuThreadTeam {
 public:
     explicit CpuThreadTeam(int size) : size_(std::max(1, size)) {
@@ -94,6 +48,8 @@ public:
     CpuThreadTeam(const CpuThreadTeam&) = delete;
     CpuThreadTeam& operator=(const CpuThreadTeam&) = delete;
 
+    int size() const { return size_; }
+
     void run(int begin, int end, const std::function<void(int, int)>& body) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -112,8 +68,8 @@ public:
 
 private:
     void chunk(int index) {
-        const int rows = end_ - begin_;
-        const int per = (rows + size_ - 1) / size_;
+        const int count = end_ - begin_;
+        const int per = (count + size_ - 1) / size_;
         const int start = begin_ + index * per;
         const int stop = std::min(end_, start + per);
         if (start < stop) {
@@ -155,59 +111,26 @@ private:
 
 inline CpuThreadTeam& cpu_thread_team() {
     static CpuThreadTeam team([] {
+        if (cpu_thread_count() > 0) {
+            return cpu_thread_count();
+        }
         const unsigned hardware = std::thread::hardware_concurrency();
         return hardware == 0 ? 1 : static_cast<int>(hardware);
     }());
     return team;
 }
 
-template <typename Fn>
-inline void cpu_parallel_rows(int y_begin, int y_end, Fn&& body) {
-    if (y_end <= y_begin) {
+// `Threads.@threads for i in begin:(end-1)`: the range is split into one
+// contiguous chunk per worker and body(i) runs for every i.
+template <typename Body>
+inline void threads_for(int begin, int end, Body&& body) {
+    if (end <= begin) {
         return;
     }
-    const std::function<void(int, int)> rows = [&body](int start, int stop) { body(start, stop); };
-    cpu_thread_team().run(y_begin, y_end, rows);
-}
-
-// Serial oracle. Correctness compares the parallel candidate with this, not
-// with the timed baseline, so a shared bug in both parallel codes still fails.
-template <typename T>
-inline CpuGrayScottState<T> cpu_serial_simulate(
-    CpuGrayScottState<T> state,
-    CpuGrayScottParams<T> params,
-    int steps
-) {
-    if (steps < 0) {
-        throw std::invalid_argument("steps must be nonnegative");
-    }
-    const int height = state.height;
-    const int width = state.width;
-    for (int step = 0; step < steps; ++step) {
-        state.u_next = state.u;
-        state.v_next = state.v;
-        for (int y = 1; y < height - 1; ++y) {
-            for (int x = 1; x < width - 1; ++x) {
-                const std::size_t index = static_cast<std::size_t>(y * width + x);
-                const T u_center = state.u[index];
-                const T v_center = state.v[index];
-                const T lap_u = state.u[index - static_cast<std::size_t>(width)] +
-                    state.u[index + static_cast<std::size_t>(width)] +
-                    state.u[index - 1] + state.u[index + 1] - T(4) * u_center;
-                const T lap_v = state.v[index - static_cast<std::size_t>(width)] +
-                    state.v[index + static_cast<std::size_t>(width)] +
-                    state.v[index - 1] + state.v[index + 1] - T(4) * v_center;
-                const T reaction = u_center * v_center * v_center;
-                state.u_next[index] = u_center + params.dt * (
-                    params.diffusion_u * lap_u - reaction + params.feed * (T(1) - u_center)
-                );
-                state.v_next[index] = v_center + params.dt * (
-                    params.diffusion_v * lap_v + reaction - (params.feed + params.kill) * v_center
-                );
-            }
+    const std::function<void(int, int)> chunk = [&body](int start, int stop) {
+        for (int i = start; i < stop; ++i) {
+            body(i);
         }
-        state.u.swap(state.u_next);
-        state.v.swap(state.v_next);
-    }
-    return state;
+    };
+    cpu_thread_team().run(begin, end, chunk);
 }

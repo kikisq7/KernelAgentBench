@@ -5,6 +5,7 @@ import math
 import shlex
 import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -24,7 +25,6 @@ from .schemas import (
     StudyConfig,
     TokenRecord,
     TrialRecord,
-    is_julia_language,
 )
 from .tracing import add_trace_outputs, trace_span
 
@@ -80,6 +80,14 @@ class TrialState(TypedDict, total=False):
     evaluation_wall_seconds: float | None
     charged_cents: float
 
+
+
+def public_test_argv(command: str) -> list[str]:
+    """Run `python3 ...` public tests with the harness interpreter, which has Numba."""
+    argv = shlex.split(command)
+    if argv and argv[0] in {"python", "python3"}:
+        argv[0] = sys.executable
+    return argv
 
 def _sum_tokens(current: dict[str, Any], new: TokenRecord) -> TokenRecord:
     previous = TokenRecord.model_validate(current) if current else TokenRecord(available=True)
@@ -357,7 +365,7 @@ class TrialGraph:
     def _public_checks(self, state: TrialState) -> dict[str, Any]:
         study = StudyConfig.model_validate(state["study"])
         target = self._target(study, state["language"])
-        command = shlex.split(target.public_test_command)
+        command = public_test_argv(target.public_test_command)
         validation_error = ""
         try:
             self.manager.validate_changes(self._worktree(state), target.editable_paths)
@@ -572,9 +580,7 @@ class TrialGraph:
                 raise ValueError(
                     f"result language {result.language} does not match {state['language']}"
                 )
-            if result.status != "error" and (
-                is_julia_language(result.language) or result.language in {"cpp", "cpp-cpu"}
-            ):
+            if result.status != "error":
                 target = self._target(study, state["language"])
                 expected = (target.evaluation or study.evaluation).correctness_dtypes
                 seen = {case.get("dtype") for case in result.correctness_cases}
@@ -762,6 +768,12 @@ class TrialGraph:
         worktree = self.manager.create_worktree(trial_id, baseline_commit)
         target = self._target(study, language)
         prompt = (worktree.project / target.prompt_path).read_text(encoding="utf-8")
+        prompt = (
+            prompt.rstrip()
+            + "\n\nPublic test command (run it from the workspace root):\n    "
+            + shlex.join(public_test_argv(target.public_test_command))
+            + "\n"
+        )
         initial: TrialState = {
             "study": study.model_dump(mode="json"),
             "study_hash": study_hash,

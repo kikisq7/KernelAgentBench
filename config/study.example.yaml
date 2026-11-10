@@ -1,52 +1,35 @@
-study_id: gray-scott-julia-backends-v2
-task_version: gray-scott-2d-five-point-v1
+study_id: gray-scott-notebook-v3
+task_version: gray-scott-sc25-notebook-v3
 seed: 20260918
 replicates: 3
 trace_content: true
 
-# Exact pins: discovery fails loudly instead of falling back to another model.
 models:
   - alias: opus-5.5
     match: "^claude-opus-5-5$"
+    provider: anthropic
+    model_id: claude-opus-5-5
+    effort: high
     newest: true
   - alias: gpt-6-astra
     match: "^gpt-6-astra$"
+    provider: openai
+    model_id: gpt-6-astra
+    effort: high
     newest: true
   - alias: composer-2.5
     match: "^composer-2\\.5$"
     newest: true
+  # Moonshot open-weight Kimi (Cursor catalog: kimi-k3; also kimi-k2.7-code).
+  - alias: kimi-k3
+    match: "^kimi-k3$"
+    newest: true
 
-# Julia-only study. Agents still run the existing optimize → test → eval loop.
-# KernelAbstractions is the focus track (CPU + NVIDIA now; AMD/ROCm later).
+# Every track starts from the most rudimentary parallel version of the SC25
+# notebook (kernels/gray_scott/UPSTREAM.md). That baseline is both the timing
+# denominator and the correctness oracle: a candidate passes when it reproduces
+# the baseline's Float64 fields within atol/rtol.
 languages:
-  - id: julia-ka
-    backend: ka
-    requires_gpu: true
-    evaluate_locally: false
-    editable_paths:
-      - kernels/gray_scott/ka/candidate.jl
-    workspace_paths:
-      - kernels/gray_scott/reference.jl
-      - kernels/gray_scott/ka
-      - julia
-      - prompts/optimize_gray_scott_ka.md
-    public_test_command: >-
-      julia --project=julia julia/test/runtests.jl ka
-    prompt_path: prompts/optimize_gray_scott_ka.md
-  - id: julia-cuda
-    backend: cuda
-    requires_gpu: true
-    evaluate_locally: false
-    editable_paths:
-      - kernels/gray_scott/cuda/candidate.jl
-    workspace_paths:
-      - kernels/gray_scott/reference.jl
-      - kernels/gray_scott/cuda
-      - julia
-      - prompts/optimize_gray_scott_cuda.md
-    public_test_command: >-
-      julia --project=julia julia/test/runtests.jl cuda
-    prompt_path: prompts/optimize_gray_scott_cuda.md
   - id: julia-cpu
     backend: cpu
     requires_gpu: false
@@ -54,59 +37,154 @@ languages:
     editable_paths:
       - kernels/gray_scott/cpu/candidate.jl
     workspace_paths:
-      - kernels/gray_scott/reference.jl
+      - kernels/gray_scott/notebook.jl
       - kernels/gray_scott/cpu
       - julia
       - prompts/optimize_gray_scott_cpu.md
-    public_test_command: >-
-      julia --project=julia julia/test/runtests.jl cpu
+    public_test_command: julia --threads=4 --project=julia julia/test/runtests.jl cpu
     prompt_path: prompts/optimize_gray_scott_cpu.md
     evaluation:
-      dtype: Float32
-      correctness_shapes:
-        - [31, 29]
-        - [64, 64]
-        - [127, 65]
-      performance_shapes:
-        - [256, 256]
-        - [512, 512]
-        - [1024, 1024]
+      correctness_shapes: [[31, 29], [64, 64], [127, 65]]
+      performance_shapes: [[256, 256], [512, 512], [1024, 1024]]
       steps: 200
       warmups: 1
-      repetitions: 5
-      atol: 0.00002
-      rtol: 0.0002
+      repetitions: 3
+      atol: 1.0e-10
+      rtol: 1.0e-8
       max_regression_fraction: 0.03
       min_relative_improvement: 0.05
-      correctness_dtypes: [Float32, Float64]
-      float64_atol: 1.0e-12
-      float64_rtol: 1.0e-10
+      # 4 = the M1's performance cores; the same count for Julia, C++, and Numba.
+      cpu_threads: 4
+  - id: julia-cuda
+    backend: cuda
+    requires_gpu: true
+    evaluate_locally: false
+    editable_paths:
+      - kernels/gray_scott/cuda/candidate.jl
+    workspace_paths:
+      - kernels/gray_scott/notebook.jl
+      - kernels/gray_scott/cuda
+      - julia
+      - prompts/optimize_gray_scott_cuda.md
+    public_test_command: julia --project=julia julia/test/runtests.jl cuda
+    prompt_path: prompts/optimize_gray_scott_cuda.md
+  - id: julia-ka
+    backend: ka
+    requires_gpu: true
+    evaluate_locally: false
+    editable_paths:
+      - kernels/gray_scott/ka/candidate.jl
+    workspace_paths:
+      - kernels/gray_scott/notebook.jl
+      - kernels/gray_scott/ka
+      - kernels/gray_scott/cpu/baseline.jl
+      - julia
+      - prompts/optimize_gray_scott_ka.md
+    public_test_command: julia --threads=4 --project=julia julia/test/runtests.jl ka
+    prompt_path: prompts/optimize_gray_scott_ka.md
+  - id: cpp-cpu
+    backend: cpu
+    requires_gpu: false
+    evaluate_locally: true
+    editable_paths:
+      - cpp/gray_scott/cpu/candidate.hpp
+    workspace_paths:
+      - cpp/gray_scott/notebook.hpp
+      - cpp/gray_scott/cpu
+      - cpp/eval_common.hpp
+      - cpp/evaluate_cpu.cpp
+      - cpp/test
+      - prompts/optimize_gray_scott_cpp_cpu.md
+    public_test_command: bash cpp/test/run_cpu_tests.sh
+    prompt_path: prompts/optimize_gray_scott_cpp_cpu.md
+    evaluation:
+      correctness_shapes: [[31, 29], [64, 64], [127, 65]]
+      performance_shapes: [[256, 256], [512, 512], [1024, 1024]]
+      steps: 200
+      warmups: 1
+      repetitions: 3
+      atol: 1.0e-10
+      rtol: 1.0e-8
+      max_regression_fraction: 0.03
+      min_relative_improvement: 0.05
+      # 4 = the M1's performance cores; the same count for Julia, C++, and Numba.
+      cpu_threads: 4
+  - id: cpp
+    backend: opencl
+    requires_gpu: true
+    evaluate_locally: false
+    editable_paths:
+      - cpp/gray_scott/candidate.hpp
+      - cpp/gray_scott/candidate_kernel.cl
+    workspace_paths:
+      - cpp/gray_scott
+      - cpp/eval_common.hpp
+      - cpp/evaluate_candidate.cpp
+      - cpp/test
+      - prompts/optimize_gray_scott_cpp.md
+    public_test_command: bash cpp/test/run_opencl_tests.sh
+    prompt_path: prompts/optimize_gray_scott_cpp.md
+  - id: python-cpu
+    backend: cpu
+    requires_gpu: false
+    evaluate_locally: true
+    editable_paths:
+      - python/gray_scott/cpu/candidate.py
+    workspace_paths:
+      - python/__init__.py
+      - python/gray_scott/__init__.py
+      - python/gray_scott/notebook.py
+      - python/gray_scott/cpu
+      - python/evaluate_candidate.py
+      - python/tests
+      - prompts/optimize_gray_scott_python_cpu.md
+    public_test_command: python3 python/tests/run_tests.py cpu
+    prompt_path: prompts/optimize_gray_scott_python_cpu.md
+    evaluation:
+      correctness_shapes: [[31, 29], [64, 64], [127, 65]]
+      performance_shapes: [[256, 256], [512, 512], [1024, 1024]]
+      steps: 200
+      warmups: 1
+      repetitions: 3
+      atol: 1.0e-10
+      rtol: 1.0e-8
+      max_regression_fraction: 0.03
+      min_relative_improvement: 0.05
+      # 4 = the M1's performance cores; the same count for Julia, C++, and Numba.
+      cpu_threads: 4
+  - id: python-triton
+    backend: triton
+    requires_gpu: true
+    evaluate_locally: false
+    editable_paths:
+      - python/gray_scott/gpu/candidate.py
+    workspace_paths:
+      - python/__init__.py
+      - python/gray_scott/__init__.py
+      - python/gray_scott/notebook.py
+      - python/gray_scott/gpu
+      - python/evaluate_candidate.py
+      - python/requirements-gpu.txt
+      - python/tests
+      - prompts/optimize_gray_scott_python.md
+    public_test_command: python3 python/tests/run_tests.py triton
+    prompt_path: prompts/optimize_gray_scott_python.md
 
 budgets:
   max_agent_iterations: 5
   max_h200_evaluations: 5
-  max_total_tokens: 200000
+  max_total_tokens: 10000000
   max_wall_seconds: 21600
 
+# GPU tracks (H200).
 evaluation:
-  dtype: Float32
-  correctness_shapes:
-    - [31, 29]
-    - [64, 64]
-    - [127, 65]
-  performance_shapes:
-    - [1024, 1024]
-    - [2048, 2048]
-    - [4096, 4096]
+  dtype: Float64
+  correctness_shapes: [[31, 29], [64, 64], [127, 65]]
+  performance_shapes: [[1024, 1024], [2048, 2048], [4096, 4096]]
   steps: 1000
-  warmups: 3
-  repetitions: 10
-  atol: 0.00002
-  rtol: 0.0002
+  warmups: 1
+  repetitions: 3
+  atol: 1.0e-10
+  rtol: 1.0e-8
   max_regression_fraction: 0.03
   min_relative_improvement: 0.05
-  # Correctness gate runs in both precisions; timing stays on `dtype`.
-  # atol/rtol above apply to Float32.
-  correctness_dtypes: [Float32, Float64]
-  float64_atol: 1.0e-12
-  float64_rtol: 1.0e-10

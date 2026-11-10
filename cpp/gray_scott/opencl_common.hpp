@@ -1,43 +1,27 @@
 #pragma once
 
+// OpenCL plumbing shared by the baseline, the candidate, and the evaluator.
+
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
 #else
 #include <CL/cl.h>
 #endif
 
-#include <chrono>
-#include <cmath>
+#include "notebook.hpp"
+
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
-
-struct GrayScottParams {
-    float diffusion_u = 0.16f;
-    float diffusion_v = 0.08f;
-    float feed = 0.035f;
-    float kill = 0.065f;
-    float dt = 1.0f;
-};
 
 inline void cl_check(cl_int status, const char* operation) {
     if (status != CL_SUCCESS) {
         throw std::runtime_error(std::string(operation) + " failed with OpenCL error " +
                                  std::to_string(status));
     }
-}
-
-inline std::string read_text_file(const std::string& path) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("failed to read " + path);
-    }
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    return buffer.str();
 }
 
 struct OpenCLRuntime {
@@ -77,12 +61,11 @@ struct OpenCLRuntime {
         );
         device = devices.front();
 
-        cl_int context_error = 0;
-        context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &context_error);
-        cl_check(context_error, "clCreateContext");
-        cl_int queue_error = 0;
-        queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &queue_error);
-        cl_check(queue_error, "clCreateCommandQueue");
+        cl_int error = 0;
+        context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &error);
+        cl_check(error, "clCreateContext");
+        queue = clCreateCommandQueue(context, device, 0, &error);
+        cl_check(error, "clCreateCommandQueue");
     }
 
     std::string device_name() const {
@@ -101,204 +84,94 @@ struct OpenCLRuntime {
     }
 };
 
-struct DeviceFields {
-    cl_mem u = nullptr;
-    cl_mem v = nullptr;
-    cl_mem u_next = nullptr;
-    cl_mem v_next = nullptr;
-    int height = 0;
-    int width = 0;
-};
-
-struct DeviceFieldsF64 {
-    cl_mem u = nullptr;
-    cl_mem v = nullptr;
-    cl_mem u_next = nullptr;
-    cl_mem v_next = nullptr;
-    int height = 0;
-    int width = 0;
-};
-
-inline bool device_supports_fp64() {
-    OpenCLRuntime& runtime = OpenCLRuntime::instance();
-    cl_ulong config = 0;
-    if (clGetDeviceInfo(
-            runtime.device, CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(config), &config, nullptr
-        ) != CL_SUCCESS) {
-        return false;
-    }
-    return config != 0;
-}
-
 inline void require_fp64_device() {
-    if (!device_supports_fp64()) {
-        throw std::runtime_error("OpenCL device does not support double-precision kernels");
+    cl_device_fp_config config = 0;
+    const cl_int status = clGetDeviceInfo(
+        OpenCLRuntime::instance().device, CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(config), &config, nullptr
+    );
+    if (status != CL_SUCCESS || config == 0) {
+        throw std::runtime_error("no OpenCL GPU with double precision on this host");
     }
 }
 
-inline DeviceFields prepare_fields(
-    const std::vector<float>& u,
-    const std::vector<float>& v,
-    int height,
-    int width
-) {
-    OpenCLRuntime& runtime = OpenCLRuntime::instance();
-    DeviceFields state;
-    state.height = height;
-    state.width = width;
-    const std::size_t bytes = u.size() * sizeof(float);
-    cl_int error = 0;
-    state.u = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer u");
-    state.v = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer v");
-    state.u_next = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer u_next");
-    state.v_next = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer v_next");
-    cl_check(
-        clEnqueueWriteBuffer(runtime.queue, state.u, CL_TRUE, 0, bytes, u.data(), 0, nullptr, nullptr),
-        "write u"
-    );
-    cl_check(
-        clEnqueueWriteBuffer(runtime.queue, state.v, CL_TRUE, 0, bytes, v.data(), 0, nullptr, nullptr),
-        "write v"
-    );
-    cl_check(
-        clEnqueueWriteBuffer(
-            runtime.queue, state.u_next, CL_TRUE, 0, bytes, u.data(), 0, nullptr, nullptr
-        ),
-        "write u_next"
-    );
-    cl_check(
-        clEnqueueWriteBuffer(
-            runtime.queue, state.v_next, CL_TRUE, 0, bytes, v.data(), 0, nullptr, nullptr
-        ),
-        "write v_next"
-    );
-    return state;
+// Kernel sources sit next to this header.
+inline std::filesystem::path opencl_kernel_path(const std::string& name) {
+    return std::filesystem::path(__FILE__).parent_path() / name;
 }
 
-inline void release_fields(DeviceFields& state) {
-    if (state.u) clReleaseMemObject(state.u);
-    if (state.v) clReleaseMemObject(state.v);
-    if (state.u_next) clReleaseMemObject(state.u_next);
-    if (state.v_next) clReleaseMemObject(state.v_next);
-    state = {};
-}
-
-inline DeviceFieldsF64 prepare_fields_f64(
-    const std::vector<double>& u,
-    const std::vector<double>& v,
-    int height,
-    int width
-) {
-    require_fp64_device();
-    OpenCLRuntime& runtime = OpenCLRuntime::instance();
-    DeviceFieldsF64 state;
-    state.height = height;
-    state.width = width;
-    const std::size_t bytes = u.size() * sizeof(double);
-    cl_int error = 0;
-    state.u = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer u f64");
-    state.v = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer v f64");
-    state.u_next = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer u_next f64");
-    state.v_next = clCreateBuffer(runtime.context, CL_MEM_READ_WRITE, bytes, nullptr, &error);
-    cl_check(error, "clCreateBuffer v_next f64");
-    cl_check(
-        clEnqueueWriteBuffer(runtime.queue, state.u, CL_TRUE, 0, bytes, u.data(), 0, nullptr, nullptr),
-        "write u f64"
-    );
-    cl_check(
-        clEnqueueWriteBuffer(runtime.queue, state.v, CL_TRUE, 0, bytes, v.data(), 0, nullptr, nullptr),
-        "write v f64"
-    );
-    cl_check(
-        clEnqueueWriteBuffer(
-            runtime.queue, state.u_next, CL_TRUE, 0, bytes, u.data(), 0, nullptr, nullptr
-        ),
-        "write u_next f64"
-    );
-    cl_check(
-        clEnqueueWriteBuffer(
-            runtime.queue, state.v_next, CL_TRUE, 0, bytes, v.data(), 0, nullptr, nullptr
-        ),
-        "write v_next f64"
-    );
-    return state;
-}
-
-inline void release_fields_f64(DeviceFieldsF64& state) {
-    if (state.u) clReleaseMemObject(state.u);
-    if (state.v) clReleaseMemObject(state.v);
-    if (state.u_next) clReleaseMemObject(state.u_next);
-    if (state.v_next) clReleaseMemObject(state.v_next);
-    state = {};
-}
-
-inline std::pair<std::vector<double>, std::vector<double>> copy_fields_f64(const DeviceFieldsF64& state) {
-    OpenCLRuntime& runtime = OpenCLRuntime::instance();
-    const std::size_t count = static_cast<std::size_t>(state.height) * state.width;
-    const std::size_t bytes = count * sizeof(double);
-    std::vector<double> u(count), v(count);
-    cl_check(
-        clEnqueueReadBuffer(runtime.queue, state.u, CL_TRUE, 0, bytes, u.data(), 0, nullptr, nullptr),
-        "read u f64"
-    );
-    cl_check(
-        clEnqueueReadBuffer(runtime.queue, state.v, CL_TRUE, 0, bytes, v.data(), 0, nullptr, nullptr),
-        "read v f64"
-    );
-    return {std::move(u), std::move(v)};
-}
-
-inline std::pair<std::vector<float>, std::vector<float>> copy_fields(const DeviceFields& state) {
-    OpenCLRuntime& runtime = OpenCLRuntime::instance();
-    const std::size_t count = static_cast<std::size_t>(state.height) * state.width;
-    const std::size_t bytes = count * sizeof(float);
-    std::vector<float> u(count), v(count);
-    cl_check(
-        clEnqueueReadBuffer(runtime.queue, state.u, CL_TRUE, 0, bytes, u.data(), 0, nullptr, nullptr),
-        "read u"
-    );
-    cl_check(
-        clEnqueueReadBuffer(runtime.queue, state.v, CL_TRUE, 0, bytes, v.data(), 0, nullptr, nullptr),
-        "read v"
-    );
-    return {std::move(u), std::move(v)};
-}
-
-inline cl_program build_program_from_source(const std::string& source) {
+inline cl_program build_program_from_file(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to read " + path.string());
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string source = buffer.str();
     OpenCLRuntime& runtime = OpenCLRuntime::instance();
     const char* sources[] = {source.c_str()};
     const std::size_t lengths[] = {source.size()};
     cl_int error = 0;
     cl_program program = clCreateProgramWithSource(runtime.context, 1, sources, lengths, &error);
     cl_check(error, "clCreateProgramWithSource");
-    error = clBuildProgram(program, 1, &runtime.device, "-cl-fast-relaxed-math", nullptr, nullptr);
+    error = clBuildProgram(program, 1, &runtime.device, "", nullptr, nullptr);
     if (error != CL_SUCCESS) {
         std::size_t log_size = 0;
         clGetProgramBuildInfo(program, runtime.device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-        std::vector<char> log(log_size);
-        clGetProgramBuildInfo(
-            program, runtime.device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr
-        );
-        std::string message(log.data());
+        std::vector<char> log(log_size + 1, '\0');
+        clGetProgramBuildInfo(program, runtime.device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
         clReleaseProgram(program);
-        throw std::runtime_error("OpenCL build failed:\n" + message);
+        throw std::runtime_error("OpenCL build failed for " + path.string() + ":\n" + log.data());
     }
     return program;
 }
 
-inline float elapsed_ms(cl_event event) {
-    cl_ulong start = 0;
-    cl_ulong end = 0;
-    cl_check(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr),
-             "profiling start");
-    cl_check(clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr),
-             "profiling end");
-    return static_cast<float>((end - start) * 1e-6);
+inline cl_kernel create_kernel(cl_program program, const char* name) {
+    cl_int error = 0;
+    cl_kernel kernel = clCreateKernel(program, name, &error);
+    cl_check(error, name);
+    return kernel;
+}
+
+inline cl_mem device_copy(const std::vector<double>& host) {
+    OpenCLRuntime& runtime = OpenCLRuntime::instance();
+    cl_int error = 0;
+    cl_mem buffer = clCreateBuffer(
+        runtime.context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+        host.size() * sizeof(double), const_cast<double*>(host.data()), &error
+    );
+    cl_check(error, "clCreateBuffer");
+    return buffer;
+}
+
+inline cl_mem device_alloc(std::size_t count) {
+    cl_int error = 0;
+    cl_mem buffer = clCreateBuffer(
+        OpenCLRuntime::instance().context, CL_MEM_READ_WRITE, count * sizeof(double), nullptr, &error
+    );
+    cl_check(error, "clCreateBuffer");
+    return buffer;
+}
+
+inline std::vector<double> host_copy(cl_mem buffer, std::size_t count) {
+    std::vector<double> host(count);
+    cl_check(
+        clEnqueueReadBuffer(
+            OpenCLRuntime::instance().queue, buffer, CL_TRUE, 0, count * sizeof(double),
+            host.data(), 0, nullptr, nullptr
+        ),
+        "clEnqueueReadBuffer"
+    );
+    return host;
+}
+
+inline void release_buffer(cl_mem& buffer) {
+    if (buffer != nullptr) {
+        clReleaseMemObject(buffer);
+        buffer = nullptr;
+    }
+}
+
+template <typename T>
+inline void set_arg(cl_kernel kernel, cl_uint index, const T& value) {
+    cl_check(clSetKernelArg(kernel, index, sizeof(T), &value), "clSetKernelArg");
 }

@@ -6,13 +6,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "3.0"
 
 JULIA_BACKENDS = {
     "julia": "cuda",
     "julia-cpu": "cpu",
     "julia-cuda": "cuda",
     "julia-ka": "ka",
+}
+
+PYTHON_BACKENDS = {
+    "python-cpu": "cpu",
+    "python-triton": "triton",
 }
 
 
@@ -26,24 +31,28 @@ class ModelSelector(StrictModel):
     newest: bool = True
     # cursor: resolve `match` against Cursor.models.list() and run the Cursor agent.
     # anthropic: call `model_id` with ANTHROPIC_API_KEY. Never send that trial to Cursor.
-    provider: Literal["cursor", "anthropic"] = "cursor"
+    # openai: call `model_id` through the Codex CLI with OPENAI_API_KEY. Never Cursor.
+    provider: Literal["cursor", "anthropic", "openai"] = "cursor"
     model_id: str = ""
-    # Opus 5.5 thinking is always on. Effort is the only depth control; set it
+    # Effort is the only reasoning-depth control on both direct APIs; set it
     # explicitly so a trial does not follow a later API default.
-    effort: Literal["", "low", "medium", "high", "xhigh", "max"] = ""
+    effort: Literal["", "minimal", "low", "medium", "high", "xhigh", "max"] = ""
 
     @model_validator(mode="after")
-    def anthropic_models_are_literal(self) -> ModelSelector:
-        if self.provider == "anthropic":
+    def direct_api_models_are_literal(self) -> ModelSelector:
+        if self.provider in {"anthropic", "openai"}:
+            api = "Anthropic" if self.provider == "anthropic" else "OpenAI"
             if not self.model_id or any(char in self.model_id for char in " ^$[]()*+?\\"):
-                raise ValueError(
-                    f"{self.alias} uses the Anthropic API and needs a literal model_id"
-                )
+                raise ValueError(f"{self.alias} uses the {api} API and needs a literal model_id")
             if not self.effort:
-                raise ValueError(f"{self.alias} needs an explicit Anthropic effort level")
+                raise ValueError(f"{self.alias} needs an explicit {api} effort level")
+            if self.provider == "anthropic" and self.effort == "minimal":
+                raise ValueError(f"{self.alias}: Anthropic has no 'minimal' effort")
+            if self.provider == "openai" and self.effort == "max":
+                raise ValueError(f"{self.alias}: OpenAI has no 'max' effort")
             return self
         if self.model_id or self.effort:
-            raise ValueError("model_id and effort are only valid for provider anthropic")
+            raise ValueError("model_id and effort are only valid for direct API providers")
         return self
 
 
@@ -56,7 +65,7 @@ class Budgets(StrictModel):
 
 
 class EvaluationConfig(StrictModel):
-    dtype: str = "Float32"
+    dtype: str = "Float64"
     correctness_shapes: list[tuple[int, int]]
     performance_shapes: list[tuple[int, int]]
     steps: int = Field(ge=1)
@@ -66,13 +75,16 @@ class EvaluationConfig(StrictModel):
     rtol: float = Field(ge=0)
     max_regression_fraction: float = Field(ge=0, lt=1)
     min_relative_improvement: float = Field(ge=0, lt=1)
-    # Correctness runs in every listed precision; timing uses `dtype` only.
-    # `atol`/`rtol` apply to Float32 and `float64_atol`/`float64_rtol` to Float64.
+    # The notebook baseline is Float64 only and doubles as the correctness oracle,
+    # so `atol`/`rtol` bound candidate-vs-baseline differences. The Float32 and
+    # float64_* fields remain so pre-v3 manifests still validate.
     correctness_dtypes: list[Literal["Float32", "Float64"]] = Field(
-        default_factory=lambda: ["Float32", "Float64"], min_length=1
+        default=["Float64"], min_length=1
     )
-    float64_atol: float = Field(default=1e-12, ge=0)
-    float64_rtol: float = Field(default=1e-10, ge=0)
+    float64_atol: float = Field(default=1e-10, ge=0)
+    float64_rtol: float = Field(default=1e-8, ge=0)
+    # Worker threads for CPU tracks (Julia --threads, C++ pool, Numba); 0 = all cores.
+    cpu_threads: int = Field(default=0, ge=0)
 
 
 def _path_covered(needed: str, allowed: str) -> bool:
@@ -86,7 +98,7 @@ class LanguageTarget(StrictModel):
     editable_paths: list[str]
     public_test_command: str
     prompt_path: str
-    backend: Literal["cpu", "cuda", "ka", "opencl"] = "ka"
+    backend: Literal["cpu", "cuda", "ka", "opencl", "triton"] = "ka"
     requires_gpu: bool = True
     evaluate_locally: bool = False
     workspace_paths: list[str] = Field(default_factory=list)
@@ -113,6 +125,10 @@ def julia_backend_for_language(language: str) -> str | None:
 
 def is_julia_language(language: str) -> bool:
     return language in JULIA_BACKENDS
+
+
+def python_backend_for_language(language: str) -> str | None:
+    return PYTHON_BACKENDS.get(language)
 
 
 class StudyConfig(StrictModel):
@@ -158,6 +174,10 @@ class OrcdConfig(StrictModel):
     auto_evaluate: bool = True
     salloc_job_id: str = ""
     setup_commands: list[str] = Field(default_factory=list)
+    # python-triton jobs: commands that put python3 >= 3.10 on PATH, and the venv
+    # (created on first use from python/requirements-gpu.txt) that holds torch/triton.
+    python_setup_commands: list[str] = Field(default_factory=lambda: ["module load miniforge"])
+    triton_venv: str = "$HOME/.kab-triton-venv"
     container_image: str = ""
 
     @model_validator(mode="after")

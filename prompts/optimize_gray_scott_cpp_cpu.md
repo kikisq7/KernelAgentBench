@@ -1,38 +1,52 @@
-You are optimizing a corrected two-dimensional Gray-Scott reaction-diffusion
-solver using C++17 on the CPU.
+You are optimizing a two-dimensional Gray-Scott reaction-diffusion solver in
+C++17 on the CPU.
 
-Only edit `cpp/gray_scott/cpu/candidate.hpp`. Preserve the function
-`gray_scott_cpu_candidate::run` and the `CpuGrayScottState` / `CpuGrayScottParams`
-types, along with the numerical semantics. You may change loops, memory layout,
-and threading inside that file. Do not weaken tests, special-case benchmark
-dimensions, cache expected outputs, or introduce network access.
+The baseline is the most rudimentary parallel version of the SC25 HPC tutorial
+notebook (`parts/gpu/gray-scott.ipynb`, JuliaParallel/julia-hpc-tutorial-sc25):
+a two-pass update that computes DU and DV from the current U and V, then adds
+DU*dt and DV*dt, with D_u=0.16, D_v=0.08, F=0.035, k=0.06, dt=1, dx=1. Your
+candidate starts as an exact copy of that baseline.
+
+Only edit `cpp/gray_scott/cpu/candidate.hpp`. Preserve
+`gray_scott_cpu_candidate::run(CpuGrayScottState&, const GrayScottParams&, int)`.
+You may change loops, memory layout, allocation, and threading inside that file. Do not weaken tests, special-case benchmark dimensions, cache expected
+outputs, or introduce network access.
 
 Caveats:
 - The parallel implementation must adhere to the Gray-Scott algorithm itself.
-  Do not change the update rule, stencil, boundary conditions, or timestep
-  semantics.
+  Do not change the update rule, the five-point Laplacian, the fixed ghost cells,
+  or the timestep semantics: every cell's step-n+1 value depends only on
+  step-n values.
 - Do not add constraints that make the parallel version essentially serial,
-  including size thresholds that skip thread parallelism and fall back to a
-  serial loop.
+  including size thresholds that skip thread parallelism and fall back to a serial loop.
 - Improve runtime without changing the algorithm and without serializing work
   that should stay parallel.
 - The scored path is the host CPU. Do not move the candidate onto OpenCL, CUDA,
   or any GPU API.
-- For thread parallelism, use `std::thread` from the C++17 standard library.
-  Do not require OpenMP, TBB, or a nonstandard runtime. The initial candidate
-  partitions rows with `cpu_parallel_rows`, which runs on a persistent thread
-  team shared with the baseline.
+- Use `std::thread`-based parallelism from C++17. `threads_for` (in
+  `types.hpp`) runs on a persistent pool of 4 workers shared with the baseline,
+  the counterpart of Julia's `Threads.@threads`. Do not require OpenMP, TBB, or
+  another nonstandard runtime. The evaluator is compiled with
+  `-O3 -ffp-contract=off`; call `std::fma` yourself if you want fused
+  multiply-adds.
+
+Correctness is a hard gate, checked in Float64 against the baseline itself:
+from the same initial fields, the candidate's U and V must match the baseline's
+within atol=1e-10 and rtol=1e-8 after 1, 5, and 50 steps on 31x29, 64x64, and
+127x65 grids, and again after every timed run. The outer ring of cells must not
+change. Reordering floating-point operations is fine at that tolerance;
+changing the update is not. Grids are nx-by-ny with x the contiguous dimension
+and need not be square or a multiple of any tile size.
 
 This is the current benchmarking status of the parallel algorithms:
 [Benchmark Output]
 No scored timings have been recorded yet. The candidate currently matches the
-trusted C++ CPU baseline, so the first evaluation should be about 1.0x.
+baseline, so the first evaluation should be about 1.0x.
 
 Primary objective: maximize steady-state timesteps per second over every
-required workload. Correctness is a hard gate. You have at most five scored
-evaluations; the trial stops early if speedup does not improve by at least 5%.
-Correctness is checked in both Float32 and Float64 against a serial reference,
-so keep the arithmetic generic over the element type. Timing uses Float32 and
-runs only after that correctness gate passes.
+required workload. Scored runs are on the host CPU with 4 threads, on 256x256, 512x512, and 1024x1024 grids for 200 steps. Speedup is the baseline's median time divided by
+the candidate's, as a geometric mean over the grids. You have at most five
+scored evaluations; the trial stops after two consecutive scored runs that do
+not improve speedup by at least 5% over the incumbent (or 1.0x on the first).
 Run the public test command before returning and summarize the optimization
 and expected bottleneck.

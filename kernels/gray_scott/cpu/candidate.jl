@@ -1,59 +1,63 @@
 module GrayScottCandidate
 
-using Polyester
+# Editable candidate. It starts identical to baseline.jl, which is the scored
+# reference for both speed and correctness. Keep prepare_candidate,
+# run_candidate!, and candidate_fields.
 
 export candidate_fields, prepare_candidate, run_candidate!
 
-# This file is the only source file coding agents may edit for the CPU backend.
-# The initial candidate intentionally matches the trusted corrected baseline.
-mutable struct CandidateState{A}
-    u::A
-    v::A
-    u_next::A
-    v_next::A
+function laplacian(A, x, y, dx)
+    @inbounds DAx = (A[x-1, y] - (2 * A[x, y]) + A[x+1, y]) / dx
+    @inbounds DAy = (A[x, y-1] - (2 * A[x, y]) + A[x, y+1]) / dx
+    return DAx + DAy
 end
 
-function prepare_candidate(u::AbstractMatrix{T}, v::AbstractMatrix{T}) where {T<:AbstractFloat}
-    return CandidateState(copy(u), copy(v), copy(u), copy(v))
-end
+function calculate_gs_cpu_mt!(U, V, D_u, D_v, F, k, dt, dx, nx, ny)
+    # Allocate U and V temporaries for updates
+    DU = Matrix{Float64}(undef, nx, ny)
+    DV = Matrix{Float64}(undef, nx, ny)
 
-function step!(
-    u_next::AbstractMatrix{T},
-    v_next::AbstractMatrix{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
-    p,
-) where {T<:AbstractFloat}
-    copyto!(u_next, u)
-    copyto!(v_next, v)
-    height, width = size(u)
-    @batch for x in 2:width-1
-        for y in 2:height-1
-            u_center = u[y, x]
-            v_center = v[y, x]
-            lap_u = u[y - 1, x] + u[y + 1, x] + u[y, x - 1] + u[y, x + 1] -
-                    T(4) * u_center
-            lap_v = v[y - 1, x] + v[y + 1, x] + v[y, x - 1] + v[y, x + 1] -
-                    T(4) * v_center
-            reaction = u_center * v_center * v_center
-            u_next[y, x] = u_center +
-                           p.dt * (p.diffusion_u * lap_u - reaction + p.feed * (one(T) - u_center))
-            v_next[y, x] = v_center +
-                           p.dt * (p.diffusion_v * lap_v + reaction - (p.feed + p.kill) * v_center)
+    # Compute diffusion and concentration fields changes
+    Threads.@threads for y in 2:(ny-1)
+        for x in 2:(nx-1)
+            # Compute diffusion
+            ΔU = laplacian(U, x, y, dx)
+            ΔV = laplacian(V, x, y, dx)
+
+            # Compute concentration fields changes
+            UVV = @inbounds U[x, y] * (V[x, y] ^ 2)
+            @inbounds DU[x, y] = D_u * ΔU - UVV + F * (1 - U[x, y])
+            @inbounds DV[x, y] = D_v * ΔV + UVV - (F + k) * V[x, y]
         end
     end
-    return nothing
+
+    # Update concentration fields
+    Threads.@threads for y in 2:(ny-1)
+        for x in 2:(nx-1)
+            @inbounds U[x, y] += DU[x, y] * dt
+            @inbounds V[x, y] += DV[x, y] * dt
+        end
+    end
+
+    return
 end
 
+struct CandidateState{A}
+    U::A
+    V::A
+end
+
+prepare_candidate(U::AbstractMatrix{Float64}, V::AbstractMatrix{Float64}) =
+    CandidateState(copy(U), copy(V))
+
 function run_candidate!(state::CandidateState, p, steps::Int)
+    nx, ny = size(state.U)
     for _ in 1:steps
-        step!(state.u_next, state.v_next, state.u, state.v, p)
-        state.u, state.u_next = state.u_next, state.u
-        state.v, state.v_next = state.v_next, state.v
+        calculate_gs_cpu_mt!(state.U, state.V, p.D_u, p.D_v, p.F, p.k, p.dt, p.dx, nx, ny)
     end
     return state
 end
 
-candidate_fields(state::CandidateState) = (state.u, state.v)
+candidate_fields(state::CandidateState) = (state.U, state.V)
 
 end

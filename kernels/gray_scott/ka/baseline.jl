@@ -1,82 +1,92 @@
 module GrayScottBaseline
 
+# "GPU (KernelAbstractions) Implementation of the Gray-Scott Equation" from
+# parts/gpu/gray-scott.ipynb. Two changes make it runnable and deterministic:
+#
+# 1. The kernel body is split at its @synchronize into two launches. In the
+#    notebook, @synchronize only orders one workgroup (and sits inside a
+#    divergent branch), so neighbouring workgroups race on U and V.
+# 2. The workgroup size is (16, 16). The notebook passes (cld(n, 16), cld(n, 16)),
+#    which exceeds 1024 threads per workgroup for n > 512 and cannot launch.
+#
+# The noise term is removed, and so is the no-op `[1:2]` after
+# `@index(Global, NTuple)`, which KernelAbstractions' CPU backend cannot compile.
+
 using KernelAbstractions
 using ..GrayScottKABackend
 
 export baseline_fields, prepare_baseline, run_baseline!
 
-# Match kernels/gray_scott/cuda/baseline.jl: 16×16 tiles over the full grid.
-const BASELINE_TILE = (16, 16)
+function laplacian(A, x, y, dx)
+    @inbounds DAx = (A[x-1, y] - (2 * A[x, y]) + A[x+1, y]) / dx
+    @inbounds DAy = (A[x, y-1] - (2 * A[x, y]) + A[x, y+1]) / dx
+    return DAx + DAy
+end
 
-mutable struct BaselineState{B,A}
+@kernel function calculate_gs_ka!(DU, DV, U, V, D_u, D_v, F, k, dx, nx, ny)
+    x, y = @index(Global, NTuple)
+
+    # Skip ghost cells on the boundaries
+    if (1 < x < nx) && (1 < y < ny)
+        # Compute diffusion
+        ΔU = laplacian(U, x, y, dx)
+        ΔV = laplacian(V, x, y, dx)
+
+        # Update concentration fields
+        UVV = @inbounds U[x, y] * (V[x, y] ^ 2)
+        @inbounds DU[x, y] = D_u * ΔU - UVV + F * (1 - U[x, y])
+        @inbounds DV[x, y] = D_v * ΔV + UVV - (F + k) * V[x, y]
+    end
+end
+
+@kernel function update_gs_ka!(U, V, DU, DV, dt, nx, ny)
+    x, y = @index(Global, NTuple)
+
+    # Skip ghost cells on the boundaries
+    if (1 < x < nx) && (1 < y < ny)
+        # Update concentration fields
+        @inbounds U[x, y] += DU[x, y] * dt
+        @inbounds V[x, y] += DV[x, y] * dt
+    end
+end
+
+struct BaselineState{B,A}
     backend::B
-    u::A
-    v::A
-    u_next::A
-    v_next::A
+    U::A
+    V::A
+    DU::A
+    DV::A
 end
 
 function prepare_baseline(
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T};
+    U::AbstractMatrix{Float64},
+    V::AbstractMatrix{Float64};
     backend=select_backend(),
-) where {T<:AbstractFloat}
-    u_dev = to_device(backend, u)
-    v_dev = to_device(backend, v)
-    return BaselineState(backend, u_dev, v_dev, copy(u_dev), copy(v_dev))
-end
-
-@kernel function baseline_kernel!(u_next, v_next, u, v, diffusion_u, diffusion_v, feed, kill, dt)
-    y, x = @index(Global, NTuple)
-    height, width = size(u)
-    if 1 < y < height && 1 < x < width
-        u_center = u[y, x]
-        v_center = v[y, x]
-        lap_u = u[y - 1, x] + u[y + 1, x] + u[y, x - 1] + u[y, x + 1] -
-                4 * u_center
-        lap_v = v[y - 1, x] + v[y + 1, x] + v[y, x - 1] + v[y, x + 1] -
-                4 * v_center
-        reaction = u_center * v_center * v_center
-        u_next[y, x] = u_center +
-                       dt * (diffusion_u * lap_u - reaction + feed * (1 - u_center))
-        v_next[y, x] = v_center +
-                       dt * (diffusion_v * lap_v + reaction - (feed + kill) * v_center)
-    end
-end
-
-function baseline_launch_kwargs(backend, height::Int, width::Int)
-    ndrange = (height, width)
-    if backend isa CPU
-        return ndrange, NamedTuple()
-    end
-    return ndrange, (workgroupsize=BASELINE_TILE,)
+)
+    # Transfer to the GPU
+    U_gpu = to_device(backend, U)
+    V_gpu = to_device(backend, V)
+    DU = KernelAbstractions.allocate(backend, Float64, size(U)...)
+    DV = KernelAbstractions.allocate(backend, Float64, size(U)...)
+    return BaselineState(backend, U_gpu, V_gpu, DU, DV)
 end
 
 function run_baseline!(state::BaselineState, p, steps::Int)
-    kernel! = baseline_kernel!(state.backend)
-    height, width = size(state.u)
-    ndrange, launch_kwargs = baseline_launch_kwargs(state.backend, height, width)
+    nx, ny = size(state.U)
+    # Compile KA kernels
+    calculate! = calculate_gs_ka!(state.backend, (16, 16))
+    update! = update_gs_ka!(state.backend, (16, 16))
     for _ in 1:steps
-        kernel!(
-            state.u_next,
-            state.v_next,
-            state.u,
-            state.v,
-            p.diffusion_u,
-            p.diffusion_v,
-            p.feed,
-            p.kill,
-            p.dt;
-            ndrange,
-            launch_kwargs...,
+        calculate!(
+            state.DU, state.DV, state.U, state.V, p.D_u, p.D_v, p.F, p.k, p.dx, nx, ny;
+            ndrange=(nx, ny),
         )
-        state.u, state.u_next = state.u_next, state.u
-        state.v, state.v_next = state.v_next, state.v
+        update!(state.U, state.V, state.DU, state.DV, p.dt, nx, ny; ndrange=(nx, ny))
     end
     KernelAbstractions.synchronize(state.backend)
     return state
 end
 
-baseline_fields(state::BaselineState) = (state.u, state.v)
+baseline_fields(state::BaselineState) = (state.U, state.V)
 
 end

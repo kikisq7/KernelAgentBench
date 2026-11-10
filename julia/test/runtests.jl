@@ -2,51 +2,50 @@ using Test
 using CUDA
 
 const ROOT = normpath(joinpath(@__DIR__, "..", ".."))
-include(joinpath(ROOT, "kernels", "gray_scott", "reference.jl"))
-using .GrayScottReference
+include(joinpath(ROOT, "kernels", "gray_scott", "notebook.jl"))
+using .GrayScottNotebook
 
 const REQUESTED = isempty(ARGS) ? "all" : ARGS[1]
 const SHAPES = ((31, 29), (64, 64), (127, 65))
-# Matches the evaluator defaults: (atol, rtol) per precision.
-const TOLERANCES = (Float32 => (2e-5, 2e-4), Float64 => (1e-12, 1e-10))
+const STEPS = (1, 5, 50)
+# Matches the evaluator defaults.
+const ATOL, RTOL = 1e-10, 1e-8
+const PARAMS = GrayScottParams()
 
-function check_backend(prepare, run!, fields_fn; prepare_kwargs=NamedTuple())
-    for (T, (atol, rtol)) in TOLERANCES
-        params = GrayScottParams(T)
-        for shape in SHAPES
-            u, v = initialize_fields(T, shape)
-            expected_u, expected_v = cpu_simulate(u, v, params, 5)
-            state = prepare(copy(u), copy(v); prepare_kwargs...)
-            run!(state, params, 5)
-            actual_u, actual_v = Array.(fields_fn(state))
-            @test eltype(actual_u) == T && eltype(actual_v) == T
-            @test actual_u ≈ expected_u atol=atol rtol=rtol
-            @test actual_v ≈ expected_v atol=atol rtol=rtol
-            for (actual, initial) in ((actual_u, u), (actual_v, v))
-                @test actual[[1, end], :] == initial[[1, end], :]
-                @test actual[:, [1, end]] == initial[:, [1, end]]
-            end
-        end
+function check_fields(actual_u, actual_v, expected_u, expected_v, initial_u, initial_v)
+    @test eltype(actual_u) == Float64 && eltype(actual_v) == Float64
+    @test all(isfinite, actual_u) && all(isfinite, actual_v)
+    @test actual_u ≈ expected_u atol=ATOL rtol=RTOL
+    @test actual_v ≈ expected_v atol=ATOL rtol=RTOL
+    for (actual, initial) in ((actual_u, initial_u), (actual_v, initial_v))
+        @test actual[[1, end], :] == initial[[1, end], :]
+        @test actual[:, [1, end]] == initial[:, [1, end]]
     end
 end
 
-@testset "Gray-Scott CPU reference" begin
-    params = GrayScottParams(Float32)
-    u, v = initialize_fields(Float32, (31, 29))
-    @test size(u) == (31, 29)
-    @test all(u[[1, end], :] .== 1)
-    @test all(v[:, [1, end]] .== 0)
+run_fields(prepare, run!, fields, u, v, steps; kwargs...) =
+    Array.(fields(run!(prepare(copy(u), copy(v); kwargs...), PARAMS, steps)))
 
-    result_u, result_v = cpu_simulate(u, v, params, 5)
-    repeated_u, repeated_v = cpu_simulate(u, v, params, 5)
-    @test result_u == repeated_u
-    @test result_v == repeated_v
-    @test all(isfinite, result_u)
-    @test all(isfinite, result_v)
-    @test result_u[[1, end], :] == u[[1, end], :]
-    @test result_u[:, [1, end]] == u[:, [1, end]]
-    @test result_v[[1, end], :] == v[[1, end], :]
-    @test result_v[:, [1, end]] == v[:, [1, end]]
+# The candidate must reproduce the baseline it is timed against.
+function check_backend(baseline, candidate; prepare_kwargs=NamedTuple())
+    for shape in SHAPES, steps in STEPS
+        u, v = initialize_fields(shape...)
+        expected = run_fields(baseline..., u, v, steps; prepare_kwargs...)
+        actual = run_fields(candidate..., u, v, steps; prepare_kwargs...)
+        check_fields(actual..., expected..., u, v)
+    end
+end
+
+@testset "Gray-Scott notebook initial condition" begin
+    u, v = initialize_fields(31, 29)
+    @test size(u) == (31, 29)
+    # Shared with cpp/test and python/test: the three harnesses start bit-identical.
+    @test round.(Int, vec(u)[1:8] .* 1000) == [70, 10, 16, 94, 47, 3, 53, 17]
+    @test vec(u)[end] == 0.036
+    @test sum(v) == 30.25
+    @test u[15, 14] == 0.5 && v[15, 14] == 0.25
+    @test initialize_fields(31, 29) == (u, v)
+    @test_throws ArgumentError initialize_fields(15, 32)
 end
 
 REQUESTED in ("all", "cpu") && include("cpu_tests.jl")

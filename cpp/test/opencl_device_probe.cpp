@@ -1,33 +1,24 @@
 #include "../gray_scott/candidate.hpp"
-#include "../gray_scott/opencl_common.hpp"
 
 #include <iostream>
 #include <string>
 
 // Exit codes (public gate on the laptop):
-//   0 — OpenCL GPU can run the candidate kernel (run full device correctness).
-//   2 — No usable OpenCL GPU here (skip device tests; H200 eval is the gate).
-//   1 — Unexpected setup failure (broken build tree, not a numerical mismatch).
+//   0 — an OpenCL GPU with double precision can run the candidate (run device tests).
+//   2 — no usable OpenCL GPU here (skip device tests; the H200 eval is the gate).
+//   1 — unexpected setup failure (broken build tree, not a numerical mismatch).
 
 int main() {
     try {
-        OpenCLRuntime::instance().ensure_initialized();
-        constexpr int height = 32;
-        constexpr int width = 32;
-        std::vector<float> u(static_cast<std::size_t>(height) * width, 1.0f);
-        std::vector<float> v(static_cast<std::size_t>(height) * width, 0.0f);
-        GrayScottParams params;
-        DeviceFields state = candidate::prepare_candidate(u, v, height, width);
-        candidate::run_candidate(state, params, 1);
-        release_fields(state);
+        GrayScottFields fields = initialize_fields(32, 32);
+        auto state = gray_scott_opencl_candidate::prepare(fields);
+        gray_scott_opencl_candidate::run(state, GrayScottParams{}, 1);
+        gray_scott_opencl_candidate::release(state);
         std::cout << "OpenCL device probe succeeded\n";
         return 0;
     } catch (const std::runtime_error& exception) {
         const std::string message = exception.what();
-        if (message.find("no OpenCL GPU") != std::string::npos ||
-            message.find("clEnqueueNDRangeKernel") != std::string::npos ||
-            message.find("step_kernel_f64 is unavailable") != std::string::npos ||
-            message.find("OpenCL build failed") != std::string::npos) {
+        if (message.find("no OpenCL") != std::string::npos) {
             std::cout << "OpenCL GPU unavailable on this host; skipping device tests\n";
             return 2;
         }

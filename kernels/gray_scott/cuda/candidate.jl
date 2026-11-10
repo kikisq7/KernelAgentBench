@@ -1,64 +1,79 @@
 module GrayScottCandidate
 
+# Editable candidate. It starts identical to baseline.jl, which is the scored
+# reference for both speed and correctness. Keep prepare_candidate,
+# run_candidate!, and candidate_fields.
+
 using CUDA
 
 export candidate_fields, prepare_candidate, run_candidate!
 
-# This file is the only source file coding agents may edit for the CUDA.jl backend.
-# The initial candidate intentionally matches the trusted corrected baseline.
-mutable struct CandidateState{A}
-    u::A
-    v::A
-    u_next::A
-    v_next::A
+function laplacian(A, x, y, dx)
+    @inbounds DAx = (A[x-1, y] - (2 * A[x, y]) + A[x+1, y]) / dx
+    @inbounds DAy = (A[x, y-1] - (2 * A[x, y]) + A[x, y+1]) / dx
+    return DAx + DAy
 end
 
-function prepare_candidate(u::AbstractMatrix{T}, v::AbstractMatrix{T}) where {T<:AbstractFloat}
-    u_gpu, v_gpu = CuArray(u), CuArray(v)
-    return CandidateState(u_gpu, v_gpu, copy(u_gpu), copy(v_gpu))
-end
+function calculate_gs_cuda!(DU, DV, U, V, D_u, D_v, F, k, dx, nx, ny)
+    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    y = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
-function candidate_kernel!(u_next, v_next, u, v, diffusion_u, diffusion_v, feed, kill, dt)
-    y = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    x = (blockIdx().y - 1) * blockDim().y + threadIdx().y
-    height, width = size(u)
-    if 1 < y < height && 1 < x < width
-        u_center = u[y, x]
-        v_center = v[y, x]
-        lap_u = u[y - 1, x] + u[y + 1, x] + u[y, x - 1] + u[y, x + 1] -
-                4 * u_center
-        lap_v = v[y - 1, x] + v[y + 1, x] + v[y, x - 1] + v[y, x + 1] -
-                4 * v_center
-        reaction = u_center * v_center * v_center
-        u_next[y, x] = u_center +
-                       dt * (diffusion_u * lap_u - reaction + feed * (1 - u_center))
-        v_next[y, x] = v_center +
-                       dt * (diffusion_v * lap_v + reaction - (feed + kill) * v_center)
+    # Skip ghost cells on the boundaries
+    if (1 < x < nx) && (1 < y < ny)
+        # Compute diffusion
+        ΔU = laplacian(U, x, y, dx)
+        ΔV = laplacian(V, x, y, dx)
+
+        # Update concentration fields
+        UVV = @inbounds U[x, y] * (V[x, y] ^ 2)
+        @inbounds DU[x, y] = D_u * ΔU - UVV + F * (1 - U[x, y])
+        @inbounds DV[x, y] = D_v * ΔV + UVV - (F + k) * V[x, y]
     end
+
     return
 end
 
+function update_gs_cuda!(U, V, DU, DV, dt, nx, ny)
+    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    y = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+
+    # Skip ghost cells on the boundaries
+    if (1 < x < nx) && (1 < y < ny)
+        # Update concentration fields
+        @inbounds U[x, y] += DU[x, y] * dt
+        @inbounds V[x, y] += DV[x, y] * dt
+    end
+
+    return
+end
+
+struct CandidateState{A}
+    U::A
+    V::A
+    DU::A
+    DV::A
+end
+
+function prepare_candidate(U::AbstractMatrix{Float64}, V::AbstractMatrix{Float64})
+    # Transfer to the GPU
+    U_gpu = CuArray(U)
+    V_gpu = CuArray(V)
+    return CandidateState(U_gpu, V_gpu, similar(U_gpu), similar(V_gpu))
+end
+
 function run_candidate!(state::CandidateState, p, steps::Int)
-    threads = (16, 16)
-    blocks = cld.(size(state.u), threads)
+    nx, ny = size(state.U)
     for _ in 1:steps
-        @cuda threads=threads blocks=blocks candidate_kernel!(
-            state.u_next,
-            state.v_next,
-            state.u,
-            state.v,
-            p.diffusion_u,
-            p.diffusion_v,
-            p.feed,
-            p.kill,
-            p.dt,
+        @cuda threads=(16, 16) blocks=(cld(nx, 16), cld(ny, 16)) calculate_gs_cuda!(
+            state.DU, state.DV, state.U, state.V, p.D_u, p.D_v, p.F, p.k, p.dx, nx, ny,
         )
-        state.u, state.u_next = state.u_next, state.u
-        state.v, state.v_next = state.v_next, state.v
+        @cuda threads=(16, 16) blocks=(cld(nx, 16), cld(ny, 16)) update_gs_cuda!(
+            state.U, state.V, state.DU, state.DV, p.dt, nx, ny,
+        )
     end
     return state
 end
 
-candidate_fields(state::CandidateState) = (state.u, state.v)
+candidate_fields(state::CandidateState) = (state.U, state.V)
 
 end
