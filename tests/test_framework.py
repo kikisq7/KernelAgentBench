@@ -1279,3 +1279,12 @@ def test_cursor_tokens_do_not_count_cache_reads_twice() -> None:
         {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 900}, None
     )
     assert claude.total_tokens == 915 and claude.disjoint
+
+
+def test_slurm_time_left_parsing() -> None:
+    from kernel_agent_bench.orcd import _slurm_seconds
+
+    assert _slurm_seconds("5:59:30") == 5 * 3600 + 59 * 60 + 30
+    assert _slurm_seconds("29:59") == 29 * 60 + 59
+    assert _slurm_seconds("1-00:00:01") == 86401
+    assert _slurm_seconds("UNLIMITED") is None

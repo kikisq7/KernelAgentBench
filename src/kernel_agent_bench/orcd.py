@@ -130,7 +130,9 @@ def _directive(name: str, value: str) -> str:
     return f"#SBATCH --{name}={value}" if value else ""
 
 
-HOLD_WALL_TIME = "04:00:00"
+HOLD_WALL_TIME = "06:00:00"  # mit_normal_gpu MaxTime
+# Renew rather than start an eval that the allocation could end mid-run.
+HOLD_MIN_REMAINING_SECONDS = 30 * 60
 HOLD_JOB_NAME = "kab-h200-hold"
 _HOLD_STATES = {"PENDING", "RUNNING", "CONFIGURING", "REQUEUED"}
 
@@ -720,13 +722,42 @@ def _submit_held_salloc(config: OrcdConfig) -> str:
     return _parse_salloc_job_id(_ssh_stdout(config, remote))
 
 
-def ensure_held_salloc(config: OrcdConfig, local_project: Path) -> OrcdConfig:
-    """Reuse one held H200 allocation (srun). Requires salloc_job_id or creates a new hold."""
+def _slurm_seconds(value: str) -> int | None:
+    """Parse squeue %L (`[D-]HH:MM:SS`, `MM:SS`); None for UNLIMITED/INVALID."""
+    days, _, clock = value.strip().rpartition("-")
+    parts = clock.split(":")
+    if not all(part.isdigit() for part in parts) or not 1 <= len(parts) <= 3:
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds + (int(days) * 86400 if days.isdigit() else 0)
+
+
+def held_salloc_remaining(config: OrcdConfig, job_id: str) -> int | None:
+    output = _ssh_stdout(config, f"squeue -j {shlex.quote(job_id)} -h -o %L")
+    return _slurm_seconds(output) if output else None
+
+
+def release_held_salloc(config: OrcdConfig, local_project: Path) -> str:
     config = _orcd_with_disk_salloc(config, local_project)
-    if not config.salloc_job_id.strip():
-        raise RuntimeError("ensure_held_salloc requires salloc_job_id; leave it empty for sbatch")
-    if slurm_job_state(config, config.salloc_job_id) in _HOLD_STATES:
-        return config
+    job_id = config.salloc_job_id.strip()
+    if job_id:
+        _ssh_stdout(config, f"scancel {shlex.quote(job_id)}")
+        persist_salloc_job_id(local_project, "")
+    return job_id
+
+
+def ensure_held_salloc(config: OrcdConfig, local_project: Path) -> OrcdConfig:
+    """Reuse one held H200 allocation (srun), requesting a new one when it is gone or ending."""
+    config = _orcd_with_disk_salloc(config, local_project)
+    job_id = config.salloc_job_id.strip()
+    state = slurm_job_state(config, job_id)
+    if state in _HOLD_STATES:
+        remaining = held_salloc_remaining(config, job_id) if state == "RUNNING" else None
+        if remaining is None or remaining >= HOLD_MIN_REMAINING_SECONDS:
+            return config
+        _ssh_stdout(config, f"scancel {shlex.quote(job_id)}")
     job_id = _submit_held_salloc(config)
     persist_salloc_job_id(local_project, job_id)
     return config.model_copy(update={"salloc_job_id": job_id})

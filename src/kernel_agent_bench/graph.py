@@ -882,6 +882,28 @@ class TrialGraph:
             )
             return result
 
+    def pending_nodes(self, trial_id: str) -> tuple[str, ...]:
+        snapshot = self.graph.get_state({"configurable": {"thread_id": trial_id}})
+        return tuple(snapshot.next) if snapshot.values else ()
+
+    def continue_trial(self, trial_id: str) -> TrialState:
+        """Re-run the node that was interrupted (e.g. an H200 eval), keeping earlier turns."""
+        if not self.pending_nodes(trial_id):
+            raise ValueError(f"trial {trial_id} has no interrupted step to continue")
+        values = self.state(trial_id)
+        return cast(
+            TrialState,
+            self.graph.invoke(
+                None,
+                config={
+                    "configurable": {"thread_id": trial_id},
+                    "callbacks": [],
+                    "metadata": self._metadata(values),
+                    "run_name": "kernel_agent_trial_continue",
+                },
+            ),
+        )
+
     def state(self, trial_id: str) -> TrialState:
         snapshot = self.graph.get_state({"configurable": {"thread_id": trial_id}})
         if not snapshot.values:

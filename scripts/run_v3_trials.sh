@@ -4,7 +4,9 @@
 #   scripts/run_v3_trials.sh cpu   # julia-cpu, cpp-cpu, python-cpu (scored locally)
 #   scripts/run_v3_trials.sh gpu   # julia-cuda, julia-ka, cpp, python-triton (H200)
 # Each trial logs to logs/<trial>.log. A failed trial does not stop the queue.
-# Rerunning skips trials already in results/trials.jsonl.
+# Rerunning skips trials already in results/trials.jsonl and continues trials
+# whose last step was interrupted (e.g. an H200 eval) instead of restarting them.
+# The gpu queue holds one H200 allocation for all evals and releases it at the end.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -32,6 +34,8 @@ case "$QUEUE" in
   gpu)
     LANGS="julia-cuda julia-ka cpp python-triton"
     ORCD_ARGS=(--orcd "$ORCD")
+    HOLD=$("$KAB" hold-h200 --orcd "$ORCD") || exit 1
+    echo "$(date '+%F %T') holding H200 allocation $HOLD"
     ;;
   *)
     echo "queue must be cpu or gpu" >&2
@@ -53,6 +57,12 @@ for REP in $REPLICATES; do
         echo "$(date '+%F %T') ORCD ControlMaster is gone; rerun ssh-check, then this queue" >&2
         exit 1
       fi
+      if "$KAB" interrupted --trial "$TRIAL" >/dev/null 2>&1; then
+        echo "$(date '+%F %T') continue $TRIAL"
+        "$KAB" continue --trial "$TRIAL" >>"$LOG" 2>&1
+        echo "$(date '+%F %T') exit=$? $TRIAL"
+        continue
+      fi
       echo "$(date '+%F %T') start $TRIAL baseline=$BASELINE"
       "$KAB" start \
         --study "$STUDY" \
@@ -66,4 +76,7 @@ for REP in $REPLICATES; do
     done
   done
 done
+if [[ "$QUEUE" == gpu ]]; then
+  "$KAB" release-h200 --orcd "$ORCD"
+fi
 echo "$(date '+%F %T') $QUEUE queue done"

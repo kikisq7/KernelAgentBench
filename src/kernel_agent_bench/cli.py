@@ -13,7 +13,9 @@ from .graph import TrialGraph
 from .models import discover_models, disjoint_token_usage
 from .orcd import (
     candidate_id,
+    ensure_held_salloc,
     probe_ssh,
+    release_held_salloc,
     render_slurm,
     ssh_handoff_commands,
 )
@@ -146,6 +148,48 @@ def resume(
     finally:
         runner.close()
     typer.echo(json.dumps(state, indent=2, sort_keys=True))
+
+
+@app.command("continue")
+def continue_trial(trial_id: Annotated[str, typer.Option("--trial")]) -> None:
+    """Re-run an interrupted step, such as an H200 eval, without redoing agent turns."""
+    configure_tracing()
+    runner = TrialGraph(project_root())
+    try:
+        state = runner.continue_trial(trial_id)
+    finally:
+        runner.close()
+    typer.echo(json.dumps(state, indent=2, sort_keys=True))
+
+
+@app.command("interrupted")
+def interrupted(trial_id: Annotated[str, typer.Option("--trial")]) -> None:
+    """Exit 0 if the trial has an interrupted step that `continue` can resume."""
+    runner = TrialGraph(project_root())
+    try:
+        nodes = runner.pending_nodes(trial_id)
+    finally:
+        runner.close()
+    if not nodes:
+        raise typer.Exit(1)
+    typer.echo(",".join(nodes))
+
+
+@app.command("hold-h200")
+def hold_h200(
+    orcd_path: Annotated[Path, typer.Option("--orcd", exists=True, dir_okay=False)],
+) -> None:
+    """Request (or keep) one H200 allocation that every eval reuses via srun."""
+    config = ensure_held_salloc(load_orcd(orcd_path), project_root())
+    typer.echo(config.salloc_job_id)
+
+
+@app.command("release-h200")
+def release_h200(
+    orcd_path: Annotated[Path, typer.Option("--orcd", exists=True, dir_okay=False)],
+) -> None:
+    job_id = release_held_salloc(load_orcd(orcd_path), project_root())
+    typer.echo(f"released {job_id}" if job_id else "no held allocation")
 
 
 @app.command("status")
