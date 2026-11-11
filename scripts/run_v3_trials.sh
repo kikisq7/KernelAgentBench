@@ -44,13 +44,13 @@ case "$QUEUE" in
 esac
 
 for REP in $REPLICATES; do
-  for LANG in $LANGS; do
+  for TRACK in $LANGS; do
     for MODEL in $MODELS; do
-      TRIAL="$STUDY_ID-$LANG-$MODEL-r$REP"
+      TRIAL="$STUDY_ID-$TRACK-$MODEL-r$REP"
       LOG="logs/$TRIAL.log"
       if grep -q "\"trial_id\": *\"$TRIAL\"" results/trials.jsonl 2>/dev/null; then
         echo "$(date '+%F %T') skip $TRIAL (already recorded)"
-        continue
+        builtin continue
       fi
       if [[ "$QUEUE" == gpu ]] && ! ssh -O check -o "ControlPath=$HOME/.ssh/kab-%r@%h:%p" \
         sqcheng@orcd-login.mit.edu 2>/dev/null; then
@@ -61,14 +61,17 @@ for REP in $REPLICATES; do
         echo "$(date '+%F %T') continue $TRIAL"
         "$KAB" continue --trial "$TRIAL" >>"$LOG" 2>&1
         echo "$(date '+%F %T') exit=$? $TRIAL"
-        continue
+        builtin continue
+      fi
+      START_ARGS=(--study "$STUDY")
+      if ((${#ORCD_ARGS[@]} > 0)); then
+        START_ARGS+=("${ORCD_ARGS[@]}")
       fi
       echo "$(date '+%F %T') start $TRIAL baseline=$BASELINE"
       "$KAB" start \
-        --study "$STUDY" \
-        ${ORCD_ARGS[@]+"${ORCD_ARGS[@]}"} \
+        "${START_ARGS[@]}" \
         --model "$MODEL" \
-        --language "$LANG" \
+        --language "$TRACK" \
         --replicate "$REP" \
         --baseline "$BASELINE" >"$LOG" 2>&1
       rc=$?
