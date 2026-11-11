@@ -90,7 +90,7 @@ def public_test_argv(command: str) -> list[str]:
     return argv
 
 def _sum_tokens(current: dict[str, Any], new: TokenRecord) -> TokenRecord:
-    previous = TokenRecord.model_validate(current) if current else TokenRecord(available=True)
+    previous = TokenRecord.model_validate(current) if current else TokenRecord(disjoint=True)
     return TokenRecord(
         input_tokens=previous.input_tokens + new.input_tokens,
         output_tokens=previous.output_tokens + new.output_tokens,
@@ -99,6 +99,7 @@ def _sum_tokens(current: dict[str, Any], new: TokenRecord) -> TokenRecord:
         total_tokens=previous.total_tokens + new.total_tokens,
         reasoning_tokens=(previous.reasoning_tokens or 0) + (new.reasoning_tokens or 0),
         available=previous.available and new.available,
+        disjoint=previous.disjoint and new.disjoint,
     )
 
 
@@ -798,7 +799,7 @@ class TrialGraph:
             "iteration": 1,
             "h200_evaluations": 0,
             "total_tokens": 0,
-            "token_usage": TokenRecord().model_dump(),
+            "token_usage": TokenRecord(disjoint=True).model_dump(),
             "prompt": prompt,
             "parent_candidate_id": None,
             "incumbent_candidate_id": None,

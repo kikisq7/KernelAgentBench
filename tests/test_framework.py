@@ -1244,3 +1244,38 @@ def test_budgets_are_capped_at_five_tries() -> None:
     assert geometric_mean([2.0, 8.0]) == pytest.approx(4.0)
     with pytest.raises(ValueError):
         geometric_mean([])
+
+
+def test_cursor_tokens_do_not_count_cache_reads_twice() -> None:
+    from types import SimpleNamespace
+
+    from kernel_agent_bench.models import (
+        _token_record,
+        anthropic_token_record,
+        disjoint_token_usage,
+    )
+
+    cursor = _token_record(
+        SimpleNamespace(
+            input_tokens=1000,
+            output_tokens=50,
+            cache_read_tokens=900,
+            cache_write_tokens=0,
+            total_tokens=1950,
+            reasoning_tokens=None,
+        )
+    )
+    assert (cursor.input_tokens, cursor.total_tokens, cursor.disjoint) == (100, 1050, True)
+    legacy = {
+        "input_tokens": 1000,
+        "output_tokens": 50,
+        "cache_read_tokens": 900,
+        "cache_write_tokens": 0,
+        "total_tokens": 1950,
+    }
+    assert disjoint_token_usage(legacy, "composer-2.5")["total_tokens"] == 1050
+    assert disjoint_token_usage(legacy, "claude-opus-5-5")["total_tokens"] == 1950
+    claude = anthropic_token_record(
+        {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 900}, None
+    )
+    assert claude.total_tokens == 915 and claude.disjoint

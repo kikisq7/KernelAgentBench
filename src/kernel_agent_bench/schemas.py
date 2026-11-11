@@ -231,6 +231,10 @@ class TokenRecord(StrictModel):
     total_tokens: int = 0
     reasoning_tokens: int | None = None
     available: bool = True
+    # True when input, cache read, and cache write are disjoint and total is their
+    # sum plus output. Records written before this field may count Cursor cache
+    # reads twice; see models.disjoint_token_usage.
+    disjoint: bool = False
 
 
 class WorkloadResult(StrictModel):

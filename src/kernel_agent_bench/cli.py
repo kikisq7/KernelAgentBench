@@ -4,13 +4,13 @@ import csv
 import json
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
 from .config import canonical_hash, load_orcd, load_project_env, load_study, project_root
 from .graph import TrialGraph
-from .models import discover_models
+from .models import discover_models, disjoint_token_usage
 from .orcd import (
     candidate_id,
     probe_ssh,
@@ -227,6 +227,44 @@ def summary(
     if not source.exists():
         raise typer.BadParameter("no completed trials")
     rows = read_jsonl([source])
+    runs_path = source.parent / "agent_runs.jsonl"
+    turns: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    if runs_path.exists():
+        for run in read_jsonl([runs_path]):
+            if run.get("event") == "agent_run" and run.get("token_usage"):
+                usage = disjoint_token_usage(run["token_usage"], run["resolved_model_id"])
+                turns.setdefault(run["trial_id"], []).append((int(run["iteration"]), usage))
+
+    def token_columns(row: dict[str, Any]) -> dict[str, Any]:
+        usages = turns.get(row["trial_id"])
+        per_turn = bool(usages)
+        if not usages:
+            usage = disjoint_token_usage(row["token_usage"], row["resolved_model_id"])
+            usages = [(0, usage)]
+        first_correct = row.get("first_correct_iteration")
+        columns: dict[str, Any] = {
+            field: sum(int(usage.get(field) or 0) for _, usage in usages)
+            for field in (
+                "input_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "total_tokens",
+            )
+        }
+        columns["recorded_total_tokens"] = row["token_usage"]["total_tokens"]
+        columns["tokens_to_correctness"] = (
+            sum(
+                int(usage["total_tokens"])
+                for iteration, usage in usages
+                if iteration <= int(first_correct)
+            )
+            if first_correct is not None and per_turn
+            else row.get("tokens_to_correctness")
+        )
+        return columns
+
     flattened = [
         {
             "study_id": row["study_id"],
@@ -237,9 +275,8 @@ def summary(
             "replicate": row["replicate"],
             "speedup": row.get("incumbent_speedup"),
             "h200_evaluations": row["h200_evaluations"],
-            "total_tokens": row["token_usage"]["total_tokens"],
+            **token_columns(row),
             "first_correct_iteration": row.get("first_correct_iteration"),
-            "tokens_to_correctness": row.get("tokens_to_correctness"),
             "termination_reason": row.get("termination_reason"),
         }
         for row in rows

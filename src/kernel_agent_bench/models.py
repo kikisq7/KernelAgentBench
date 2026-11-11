@@ -88,16 +88,40 @@ class AgentRun:
 
 
 def _token_record(usage: Any | None) -> TokenRecord:
+    """Cursor's input_tokens already includes cache reads; store the uncached part."""
     if usage is None:
-        return TokenRecord(available=False)
+        return TokenRecord(available=False, disjoint=True)
+    fresh = max(usage.input_tokens - usage.cache_read_tokens, 0)
     return TokenRecord(
-        input_tokens=usage.input_tokens,
+        input_tokens=fresh,
         output_tokens=usage.output_tokens,
         cache_read_tokens=usage.cache_read_tokens,
         cache_write_tokens=usage.cache_write_tokens,
-        total_tokens=usage.total_tokens,
+        total_tokens=fresh
+        + usage.output_tokens
+        + usage.cache_read_tokens
+        + usage.cache_write_tokens,
         reasoning_tokens=usage.reasoning_tokens,
+        disjoint=True,
     )
+
+
+def disjoint_token_usage(usage: dict[str, Any], resolved_model_id: str) -> dict[str, Any]:
+    """Apply the Cursor correction to a ledger row written before `disjoint` existed."""
+    if usage.get("disjoint") or uses_anthropic(resolved_model_id) or uses_openai(
+        resolved_model_id
+    ):
+        return {**usage, "disjoint": True}
+    cache_read = int(usage.get("cache_read_tokens") or 0)
+    fresh = max(int(usage.get("input_tokens") or 0) - cache_read, 0)
+    output = int(usage.get("output_tokens") or 0)
+    cache_write = int(usage.get("cache_write_tokens") or 0)
+    return {
+        **usage,
+        "input_tokens": fresh,
+        "total_tokens": fresh + output + cache_read + cache_write,
+        "disjoint": True,
+    }
 
 
 def _int_field(payload: dict[str, Any], *names: str) -> int:
@@ -132,6 +156,7 @@ def anthropic_token_record(
             cache_write_tokens=cache_write,
             total_tokens=input_tokens + output_tokens + cache_read + cache_write,
             reasoning_tokens=reasoning,
+            disjoint=True,
         )
     if not usage:
         return TokenRecord(available=False)
@@ -146,6 +171,7 @@ def anthropic_token_record(
         cache_write_tokens=cache_write,
         total_tokens=input_tokens + output_tokens + cache_read + cache_write,
         reasoning_tokens=None,
+        disjoint=True,
     )
 
 
@@ -272,6 +298,7 @@ def openai_token_record(usage: dict[str, Any] | None) -> TokenRecord:
         cache_write_tokens=0,
         total_tokens=input_tokens + output_tokens,
         reasoning_tokens=_int_field(usage, "reasoning_output_tokens"),
+        disjoint=True,
     )
 
 
